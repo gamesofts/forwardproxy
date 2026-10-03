@@ -25,7 +25,7 @@ if sys.argv[1] == 'api':
         sys.exit(1)
     print(os.environ['IS_DRAFT'])
 if sys.argv[1:3] == ['release', 'view']:
-    print('402428409')
+    print('https://api.github.com/repos/gamesofts/forwardproxy/releases/402428409')
 if sys.argv[1:3] == ['release', 'upload'] and os.environ['FAIL_UPLOAD'] == 'true':
     sys.exit(1)
 ''')
