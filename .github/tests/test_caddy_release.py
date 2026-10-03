@@ -57,7 +57,7 @@ class ReleaseDetectionTests(unittest.TestCase):
             summary = Path(directory) / "summary"
             module = {"content": base64.b64encode(b"module caddy\n\ngo 1.26.0\n").decode()}
             existing = {"draft": True, "target_commitish": "b" * 40, "assets": []}
-            env = {"REQUESTED_VERSION": "", "SOURCE_SHA": "a" * 40,
+            env = {"REQUESTED_VERSION": "", "SOURCE_SHA": "a" * 40, "GITHUB_EVENT_NAME": "schedule",
                    "GITHUB_REPOSITORY": "gamesofts/forwardproxy",
                    "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary)}
             with patch.dict(os.environ, env), patch.object(detect, "gh_api", side_effect=[self.upstream, existing, module]):
