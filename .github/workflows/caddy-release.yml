@@ -1,0 +1,185 @@
+name: Release Caddy with Naive and Cloudflare
+
+on:
+  schedule:
+    - cron: '37 4 * * *'
+  workflow_dispatch:
+    inputs:
+      caddy_version:
+        description: 'Stable Caddy tag (e.g. v2.11.7); leave empty for latest'
+        required: false
+        type: string
+  push:
+    branches: [naive]
+    paths:
+      - '.github/workflows/caddy-release.yml'
+      - '.github/scripts/*caddy*'
+      - '.github/tests/*caddy_release.py'
+  pull_request:
+    branches: [naive]
+    paths:
+      - '.github/workflows/caddy-release.yml'
+      - '.github/scripts/*caddy*'
+      - '.github/tests/*caddy_release.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: caddy-release-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'publish' }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    if: github.repository == 'gamesofts/forwardproxy'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      archive: ${{ steps.release.outputs.archive }}
+      should_build: ${{ steps.release.outputs.should_build }}
+      release_exists: ${{ steps.release.outputs.release_exists }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      make_latest: ${{ steps.release.outputs.make_latest }}
+      go_version: ${{ steps.release.outputs.go_version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.repository.default_branch }}
+      - name: Test release detection
+        run: python3 -m unittest discover -s .github/tests -v
+      - name: Select Caddy release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.caddy_version }}
+        run: |
+          export SOURCE_SHA=$(git rev-parse HEAD)
+          python3 .github/scripts/detect-caddy-release.py
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CADDY_VERSION: ${{ needs.detect.outputs.version }}
+      SOURCE_SHA: ${{ needs.detect.outputs.source_sha }}
+      ARCHIVE: ${{ needs.detect.outputs.archive }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.detect.outputs.source_sha }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ needs.detect.outputs.go_version }}
+          # Tests and xcaddy resolve newer dependencies in temporary modules.
+          cache: false
+      - name: Resolve Cloudflare plugin version
+        run: |
+          version=$(go list -m -f '{{.Version}}' github.com/caddy-dns/cloudflare@latest)
+          echo "CLOUDFLARE_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Test plugin against the selected Caddy version
+        run: bash .github/scripts/test-caddy-version.sh
+      - name: Build Linux amd64
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: bash .github/scripts/build-caddy.sh
+      - name: Validate Caddyfile with Naive forwardproxy
+        run: |
+          cat > "$RUNNER_TEMP/Caddyfile" <<'EOF'
+          {
+            admin off
+            auto_https off
+            order forward_proxy first
+          }
+          :8080 {
+            forward_proxy {
+              basic_auth smoke-test test-password
+              hide_ip
+              hide_via
+              probe_resistance
+            }
+          }
+          EOF
+          ./caddy validate --config "$RUNNER_TEMP/Caddyfile" --adapter caddyfile
+          # Adapt the DNS issuer configuration without contacting Cloudflare.
+          cat > "$RUNNER_TEMP/Cloudflare.Caddyfile" <<'EOF'
+          {
+            acme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+          }
+          example.com {
+            respond "DNS provider config check"
+          }
+          EOF
+          ./caddy adapt --config "$RUNNER_TEMP/Cloudflare.Caddyfile" --adapter caddyfile > "$RUNNER_TEMP/cloudflare-config.json"
+      - name: Package binary and build provenance
+        run: |
+          mkdir -p dist/bundle
+          cp caddy LICENSE README.md dist/bundle/
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          metadata = {
+              'caddy_version': os.environ['CADDY_VERSION'],
+              'forwardproxy_repository': os.environ['GITHUB_REPOSITORY'],
+              'forwardproxy_commit': os.environ['SOURCE_SHA'],
+              'cloudflare_plugin': 'github.com/caddy-dns/cloudflare',
+              'cloudflare_version': os.environ['CLOUDFLARE_VERSION'],
+              'platform': 'linux/amd64',
+              'cgo_enabled': False,
+              'build_run': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+          }
+          Path('dist/bundle/BUILD_INFO.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          notes = (
+              f"Caddy {metadata['caddy_version']} with this fork's Naive forwardproxy plugin and Cloudflare DNS provider.\n\n"
+              f"Platform: Linux amd64, CGO disabled.\n\n"
+              f"Caddy source: https://github.com/caddyserver/caddy/releases/tag/{metadata['caddy_version']}\n\n"
+              f"Forwardproxy source: https://github.com/{metadata['forwardproxy_repository']}/commit/{metadata['forwardproxy_commit']}\n\n"
+              f"Cloudflare plugin: github.com/caddy-dns/cloudflare {metadata['cloudflare_version']}\n\n"
+              f"Race-enabled plugin tests, binary version/module checks, and Caddyfile validation passed.\n\n"
+              f"Build: {metadata['build_run']}\n\n"
+              'Download the tar.gz and SHA256SUMS, then run `sha256sum -c SHA256SUMS`.\n'
+          )
+          Path('dist/RELEASE_NOTES.md').write_text(notes)
+          PY
+          tar -czf "dist/$ARCHIVE" -C dist/bundle caddy LICENSE README.md BUILD_INFO.json
+          (cd dist && sha256sum "$ARCHIVE" > SHA256SUMS && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: caddy-release-linux-amd64
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [detect, build]
+    if: github.event_name != 'pull_request' && needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      CADDY_VERSION: ${{ needs.detect.outputs.version }}
+      RELEASE_TAG: ${{ needs.detect.outputs.tag }}
+      ARCHIVE: ${{ needs.detect.outputs.archive }}
+      SOURCE_SHA: ${{ needs.detect.outputs.source_sha }}
+      RELEASE_EXISTS: ${{ needs.detect.outputs.release_exists }}
+      MAKE_LATEST: ${{ needs.detect.outputs.make_latest }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.detect.outputs.source_sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: caddy-release-linux-amd64
+          path: dist
+      - name: Verify uploaded archive
+        run: (cd dist && sha256sum -c SHA256SUMS)
+      - name: Publish only after all checks and asset uploads succeed
+        run: bash .github/scripts/publish-caddy-release.sh
