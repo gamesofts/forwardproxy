@@ -70,3 +70,9 @@ intermediate versions can be built with the manual version input.
 No PAT or external service is needed. The publish job requests contents write
 permission from `GITHUB_TOKEN`. The earlier **Build** workflow now only produces
 CI artifacts, so it cannot attach an older Caddy build to these new releases.
+
+Draft discovery lists releases with a contents-write token (GitHub only shows
+drafts to users with push access), because the by-tag REST endpoint does not
+return drafts. Publishing validates the draft by numeric release ID. A resumed
+draft retains its binary source commit while using the current workflow's
+publication script, so publication fixes apply to interrupted older drafts.

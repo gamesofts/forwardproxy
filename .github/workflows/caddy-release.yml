@@ -32,6 +32,10 @@ concurrency:
 jobs:
   detect:
     if: github.repository == 'gamesofts/forwardproxy'
+    # GitHub only includes draft releases for tokens with push access.
+    # Fork PRs still receive the standard read-only token.
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.release.outputs.version }}
@@ -174,7 +178,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.detect.outputs.source_sha }}
+          # Use this run's publisher fix even when resuming an older source draft.
+          # SOURCE_SHA still identifies the binary and the release tag target.
+          ref: ${{ github.sha }}
       - uses: actions/download-artifact@v4
         with:
           name: caddy-release-linux-amd64

@@ -19,6 +19,25 @@ def gh_api(path):
     return json.loads(result.stdout)
 
 
+def find_release(repository, tag):
+    published = gh_api(f"repos/{repository}/releases/tags/{tag}")
+    if published is not None:
+        return published
+    # The by-tag endpoint only returns published releases. Drafts are visible
+    # in the release list to a token with push access; search every page.
+    page = 1
+    while True:
+        releases = gh_api(f"repos/{repository}/releases?per_page=100&page={page}")
+        if releases is None:
+            raise RuntimeError("Cannot list repository releases")
+        for release in releases:
+            if release["tag_name"] == tag:
+                return release
+        if len(releases) < 100:
+            return None
+        page += 1
+
+
 def select_release(upstream, existing):
     if upstream is None:
         raise ValueError("Caddy release does not exist")
@@ -53,7 +72,7 @@ def main():
     # Validate before inserting an upstream tag into a REST path.
     selection = select_release(upstream, None)
     repository = os.environ["GITHUB_REPOSITORY"]
-    existing = gh_api(f"repos/{repository}/releases/tags/{selection['tag']}")
+    existing = find_release(repository, selection["tag"])
     selection = select_release(upstream, existing)
     source_sha = os.environ["SOURCE_SHA"]
     # Retry a partial draft using the same source snapshot as its first build.

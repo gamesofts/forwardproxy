@@ -19,7 +19,13 @@ import json, os, sys
 with open(os.environ['CALL_LOG'], 'a') as log:
     log.write(json.dumps(sys.argv[1:]) + '\\n')
 if sys.argv[1] == 'api':
+    # Reproduce GitHub's actual behavior: drafts cannot be fetched by tag.
+    if '/releases/tags/' in sys.argv[2]:
+        print('gh: Not Found (HTTP 404)', file=sys.stderr)
+        sys.exit(1)
     print(os.environ['IS_DRAFT'])
+if sys.argv[1:3] == ['release', 'view']:
+    print('https://api.github.com/repos/gamesofts/forwardproxy/releases/402428409')
 if sys.argv[1:3] == ['release', 'upload'] and os.environ['FAIL_UPLOAD'] == 'true':
     sys.exit(1)
 ''')
@@ -44,9 +50,11 @@ if sys.argv[1:3] == ['release', 'upload'] and os.environ['FAIL_UPLOAD'] == 'true
         code, calls = self.invoke()
         self.assertEqual(code, 0)
         self.assertEqual([c[:2] for c in calls if c[0] == 'release'],
-                         [['release', 'create'], ['release', 'upload'], ['release', 'edit']])
+                         [['release', 'create'], ['release', 'view'], ['release', 'upload'], ['release', 'edit']])
         self.assertIn('--draft', calls[0])
-        self.assertIn('dist/SHA256SUMS', calls[2])
+        upload = next(c for c in calls if c[:2] == ['release', 'upload'])
+        self.assertIn('dist/SHA256SUMS', upload)
+        self.assertTrue(any(c[:2] == ['api', 'repos/gamesofts/forwardproxy/releases/402428409'] for c in calls))
         self.assertIn('--draft=false', calls[-1])
 
     def test_failed_upload_never_publishes(self):
