@@ -15,7 +15,9 @@ if [[ "$RELEASE_EXISTS" == false ]]; then
 fi
 
 # Never replace an already published build, even if a human publishes it mid-run.
-[[ "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.draft')" == true ]]
+release_id=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq '.databaseId')
+[[ "$release_id" =~ ^[0-9]+$ ]]
+[[ "$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" --jq '.draft')" == true ]]
 gh release upload "$RELEASE_TAG" "dist/$ARCHIVE" dist/SHA256SUMS \
   --repo "$GITHUB_REPOSITORY" --clobber
 gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \

@@ -56,11 +56,11 @@ class ReleaseDetectionTests(unittest.TestCase):
             output = Path(directory) / "outputs"
             summary = Path(directory) / "summary"
             module = {"content": base64.b64encode(b"module caddy\n\ngo 1.26.0\n").decode()}
-            existing = {"draft": True, "target_commitish": "b" * 40, "assets": []}
+            existing = {"tag_name": "caddy-v2.11.7", "draft": True, "target_commitish": "b" * 40, "assets": []}
             env = {"REQUESTED_VERSION": "", "SOURCE_SHA": "a" * 40, "GITHUB_EVENT_NAME": "schedule",
                    "GITHUB_REPOSITORY": "gamesofts/forwardproxy",
                    "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary)}
-            with patch.dict(os.environ, env), patch.object(detect, "gh_api", side_effect=[self.upstream, existing, module]):
+            with patch.dict(os.environ, env), patch.object(detect, "gh_api", side_effect=[self.upstream, None, [existing], module]):
                 detect.main()
             text = output.read_text()
             self.assertIn("source_sha=" + "b" * 40, text)
@@ -72,6 +72,23 @@ class ReleaseDetectionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 detect.main()
             api.assert_not_called()
+
+    def test_draft_found_when_by_tag_returns_404(self):
+        draft = {"tag_name": "caddy-v2.11.7", "draft": True, "id": 402428409}
+        with patch.object(detect, "gh_api", side_effect=[None, [draft]]) as api:
+            self.assertEqual(detect.find_release("gamesofts/forwardproxy", "caddy-v2.11.7"), draft)
+            self.assertIn("per_page=100&page=1", api.call_args.args[0])
+
+    def test_draft_lookup_searches_later_pages(self):
+        first = [{"tag_name": f"other-{n}"} for n in range(100)]
+        draft = {"tag_name": "caddy-v2.11.7", "draft": True}
+        with patch.object(detect, "gh_api", side_effect=[None, first, [draft]]) as api:
+            self.assertEqual(detect.find_release("gamesofts/forwardproxy", "caddy-v2.11.7"), draft)
+            self.assertIn("page=2", api.call_args.args[0])
+
+    def test_missing_release_stops_after_last_page(self):
+        with patch.object(detect, "gh_api", side_effect=[None, []]):
+            self.assertIsNone(detect.find_release("gamesofts/forwardproxy", "caddy-v2.11.7"))
 
 
 if __name__ == "__main__":
