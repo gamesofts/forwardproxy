@@ -1,0 +1,28 @@
+name: Clean merged temporary branches
+on:
+  push:
+    branches: [naive]
+    paths: ['.github/workflows/cleanup-merged-branches.yml']
+permissions:
+  contents: write
+jobs:
+  cleanup:
+    if: github.repository == 'gamesofts/forwardproxy' && github.event.deleted == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: naive
+          fetch-depth: 0
+      - name: Delete only the reviewed, merged branch heads
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor d6293651f15fb3f5ddd706cf902b29e2006ae71e HEAD
+          git merge-base --is-ancestor c49ecffca6be0c1cd57652bbd637197db1feb971 HEAD
+          git merge-base --is-ancestor 5a70ca79c3848bd7302d81f6a12e966ae5f07265 HEAD
+          git push --atomic \
+            --force-with-lease=refs/heads/feat/caddy-release:d6293651f15fb3f5ddd706cf902b29e2006ae71e \
+            --force-with-lease=refs/heads/fix/draft-release:c49ecffca6be0c1cd57652bbd637197db1feb971 \
+            --force-with-lease=refs/heads/sync/caddy-master:5a70ca79c3848bd7302d81f6a12e966ae5f07265 \
+            origin :refs/heads/feat/caddy-release :refs/heads/fix/draft-release :refs/heads/sync/caddy-master
