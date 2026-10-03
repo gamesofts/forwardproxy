@@ -35,3 +35,38 @@ work to this dedicated branch.
 
 GitHub can suspend scheduled workflows in public repositories after 60 days of
 repository inactivity. If that happens, re-enable the workflow in Actions.
+
+## Automatic Caddy releases
+
+**Release Caddy with Naive and Cloudflare** checks the latest official Caddy stable release
+daily at 04:37 UTC. After this workflow is merged into `naive`, its first
+push run also builds the current latest version if it has not been published.
+Use **Run workflow** with an optional stable tag such as `v2.11.7` to build a
+specific release. Drafts and prereleases are rejected.
+
+Only **Linux amd64** is built, with CGO disabled. Release tags use
+`caddy-vX.Y.Z`; assets are `caddy-vX.Y.Z-linux-amd64.tar.gz` and `SHA256SUMS`.
+The archive includes `caddy`, `LICENSE`, `README.md`, and `BUILD_INFO.json` with
+the Caddy version, this fork's source commit and build-run URL.
+
+Every release includes `github.com/caddy-dns/cloudflare`, resolved to its latest
+Go module version at build time and recorded in the build metadata. Module
+registration and Cloudflare Caddyfile adaptation are checked without credentials
+or calls to the Cloudflare API. Supply your own token when using DNS challenges.
+The Go toolchain is selected from the Caddy release's `go.mod` requirement.
+
+The workflow tests the plugin against the selected Caddy version in a temporary
+module, builds with xcaddy, verifies the binary version and module registration,
+and validates a Caddyfile with authentication and probe resistance. It leaves
+this repository's `go.mod` and `go.sum` unchanged. PR runs validate and upload
+an Actions artifact; only trusted default-branch runs publish Releases.
+
+Publishing uses a draft and uploads both assets before making it public.
+Complete public releases are never rebuilt or overwritten. Interrupted drafts
+are retried with their original source commit; a failed test/build publishes
+nothing. Scheduled runs select the latest stable release visible at check time;
+intermediate versions can be built with the manual version input.
+
+No PAT or external service is needed. The publish job requests contents write
+permission from `GITHUB_TOKEN`. The earlier **Build** workflow now only produces
+CI artifacts, so it cannot attach an older Caddy build to these new releases.
