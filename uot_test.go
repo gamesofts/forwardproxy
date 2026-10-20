@@ -307,6 +307,47 @@ func TestUOTActiveCancellationAndUploadEOF(t *testing.T) {
 	}
 }
 
+
+func TestUOTDestinationCacheRecyclesExpiredEntries(t *testing.T) {
+	now := time.Now()
+	cache := make(map[M.Socksaddr]uotCachedDestination)
+	for port := 1; port <= uotCacheSize; port++ {
+		key := M.ParseSocksaddrHostPort("127.0.0.1", uint16(port))
+		cache[key] = uotCachedDestination{expires: now.Add(time.Minute)}
+	}
+	newDestination := M.ParseSocksaddrHostPort("127.0.0.1", uint16(uotCacheSize+1))
+	newEntry := uotCachedDestination{expires: now.Add(2*time.Minute)}
+
+	// Do not evict an unexpired destination to make room.
+	storeUOTDestination(cache, newDestination, newEntry, now)
+	if len(cache) != uotCacheSize {
+		t.Fatalf("cache grew beyond limit: %d", len(cache))
+	}
+	if _, exists := cache[newDestination]; exists {
+		t.Fatal("unexpected eviction of a live entry")
+	}
+
+	// Once the original entries expire, a new destination can be cached.
+	afterExpiry := now.Add(time.Minute)
+	storeUOTDestination(cache, newDestination, newEntry, afterExpiry)
+	if len(cache) != uotCacheSize {
+		t.Fatalf("cache grew beyond limit after recycling: %d", len(cache))
+	}
+	if got, exists := cache[newDestination]; !exists || !got.expires.Equal(newEntry.expires) {
+		t.Fatal("new destination was not cached after old entries expired")
+	}
+
+	// Replacing an existing entry must work even when the cache is full.
+	replacement := uotCachedDestination{expires: now.Add(3*time.Minute)}
+	storeUOTDestination(cache, newDestination, replacement, afterExpiry)
+	if got := cache[newDestination]; !got.expires.Equal(replacement.expires) {
+		t.Fatal("existing destination was not refreshed")
+	}
+	if len(cache) != uotCacheSize {
+		t.Fatalf("cache grew beyond limit after refresh: %d", len(cache))
+	}
+}
+
 func TestUOTIdleTimeout(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
