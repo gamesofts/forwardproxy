@@ -163,11 +163,9 @@ func (h Handler) serveUOT(ctx context.Context, stream net.Conn, version int) {
 			if err == nil {
 				entry.address = &net.UDPAddr{IP: IPs[0], Port: int(destination.Port)}
 			}
-			// Bound cached positive/negative decisions; a full cache never
-			// interrupts a valid session or allocates more sockets/readers.
-			if cached || len(cache) < uotCacheSize {
-				cache[destination] = entry
-			}
+			// Keep the cache bounded, recycling expired destinations when full.
+			// A full cache of live entries does not prevent forwarding uncached packets.
+			storeUOTDestination(cache, destination, entry, now)
 		}
 		if entry.address == nil {
 			continue
@@ -185,6 +183,22 @@ func (h Handler) serveUOT(ctx context.Context, stream net.Conn, version int) {
 type uotCachedDestination struct {
 	address *net.UDPAddr
 	expires time.Time
+}
+
+// Called only on a cache miss/expiry, never on a cache hit's packet hot path.
+// With at most 256 entries, a bounded scan avoids an LRU or cleanup goroutine.
+func storeUOTDestination(cache map[M.Socksaddr]uotCachedDestination, destination M.Socksaddr, entry uotCachedDestination, now time.Time) {
+	if _, exists := cache[destination]; !exists && len(cache) >= uotCacheSize {
+		for oldDestination, oldEntry := range cache {
+			if !now.Before(oldEntry.expires) {
+				delete(cache, oldDestination)
+				break
+			}
+		}
+	}
+	if _, exists := cache[destination]; exists || len(cache) < uotCacheSize {
+		cache[destination] = entry
+	}
 }
 
 type uotConnectedSocket struct{ net.Conn }
