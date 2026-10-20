@@ -163,18 +163,21 @@ func (c *caddyTestServer) server() *caddyhttp.Server {
 
 func (c *caddyTestServer) redirServer() *caddyhttp.Server {
 	return &caddyhttp.Server{
-		Listen: []string{":" + c.httpRedirPort},
+		Listen:    []string{":" + c.httpRedirPort},
+		AutoHTTPS: &caddyhttp.AutoHTTPSConfig{Disabled: true},
 		Routes: caddyhttp.RouteList{
 			{
-				Handlers: []caddyhttp.MiddlewareHandler{
-					caddyhttp.StaticResponse{
+				// Handlers is a provisioned-only field (json:"-"). Use
+				// HandlersRaw so this redirect survives TestMain's JSON marshal.
+				HandlersRaw: []json.RawMessage{
+					caddyconfig.JSONModuleObject(caddyhttp.StaticResponse{
 						StatusCode: caddyhttp.WeakString(strconv.Itoa(http.StatusPermanentRedirect)),
 						Headers: http.Header{
 							"Location":   []string{"https://" + c.addr + "/{http.request.uri}"},
 							"Connection": []string{"close"},
 						},
 						Close: true,
-					},
+					}, "handler", "static_response", nil),
 				},
 			},
 		},

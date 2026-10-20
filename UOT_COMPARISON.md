@@ -65,4 +65,4 @@ GOMAXPROCS=2 go test -run '^$' -bench 'BenchmarkUOTRelay/.*/connect=.*/bytes=(64
 
 `uot_test.go` 覆盖实际 HTTP/2 CONNECT、认证、padding 开/关、首八次 padding 后的流量、v1、v2 connect/non-connect、空包、65,000 字节 payload、IPv4/IPv6/域名、多目标、稳定出口端口、域名/IP/端口 ACL、缓存容量外流量、超大 UDP 发送失败隔离、upstream 委托、请求取消、上传 EOF、坏请求和空闲超时。
 
-受执行环境限制，本地原测试套件中两个依赖外部 DNS 的 ACL 测试无法解析 Google 域名；其余原有测试和全部新增 UoT 测试使用 `-race` 通过。完整原测试应由 GitHub Actions 的联网 Linux/Windows runner 验证。发布检查还需在选定的 Caddy 版本上运行，而不是只检查模块自己的最低依赖版本。
+受执行环境限制，本地原测试套件中两个依赖外部 DNS 的 ACL 测试无法解析 Google 域名；其余原有测试和全部新增 UoT 测试使用 `-race` 通过。联网 GitHub Actions 已通过 Go 1.22/1.23 Linux 完整原测试。最新 Caddy 的检查发现旧 redirect 夹具使用了不参与 JSON 序列化的 `Handlers` 字段，实际未安装模拟重定向 handler；改为 `HandlersRaw`，并补上真实 308/Location 断言。Windows 和选定 Caddy 版本的最终结果以对应 CI run 为准。

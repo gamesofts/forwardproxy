@@ -256,6 +256,16 @@ func TestConnectAuthWrongProbeResistRedir(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				if responseProbeResist.StatusCode != http.StatusPermanentRedirect || responseReference.StatusCode != http.StatusPermanentRedirect {
+					t.Fatalf("redirect fixtures must return 308, got %d and %d", responseProbeResist.StatusCode, responseReference.StatusCode)
+				}
+				// The fixtures redirect to their respective HTTPS listeners.
+				// Normalize just that configured authority before comparing.
+				location := responseReference.Header.Get("Location")
+				if !strings.HasPrefix(location, "https://"+caddyDummyProbeResist.addr+"/") || !strings.HasPrefix(responseProbeResist.Header.Get("Location"), "https://"+caddyForwardProxyProbeResist.addr+"/") {
+					t.Fatal("redirect fixture did not set its configured HTTPS destination")
+				}
+				responseReference.Header.Set("Location", strings.Replace(location, caddyDummyProbeResist.addr, caddyForwardProxyProbeResist.addr, 1))
 				if responseProbeResist.StatusCode != responseReference.StatusCode {
 					t.Fatalf("Expected response: %d, Got: %d\n",
 						responseReference.StatusCode, responseProbeResist.StatusCode)
