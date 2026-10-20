@@ -18,6 +18,9 @@ on:
   pull_request:
     branches: [naive]
     paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
       - '.github/workflows/caddy-release.yml'
       - '.github/scripts/*caddy*'
       - '.github/tests/*caddy_release.py'

@@ -23,6 +23,49 @@ We are also seeking experienced maintainers who have experience with these kinds
 - Access control lists
 - Optional probe resistance
 - PAC file
+- Naive-compatible SagerNet UDP over TCP (UoT v1 and v2)
+
+## UDP over TCP with Naive
+
+This fork accepts SagerNet's UoT protocol inside a normal CONNECT tunnel,
+including Naive padding. It recognizes `sp.udp-over-tcp.arpa` (v1) and
+`sp.v2.udp-over-tcp.arpa` (v2); these are protocol markers, not DNS names.
+The integration is adapted from [SagerNet/forwardproxy](https://github.com/SagerNet/forwardproxy)
+and [aUsernameWoW/forwardproxy:udpintcp](https://github.com/aUsernameWoW/forwardproxy/tree/5cf089c17a07adc32fb178957ee8a6758092cccf),
+using the [sing UoT codec](https://github.com/SagerNet/sing/tree/v0.7.5/common/uot).
+
+Build this fork, rather than the original upstream module:
+
+```sh
+xcaddy build --with github.com/caddyserver/forwardproxy=github.com/gamesofts/forwardproxy@naive --with github.com/caddy-dns/cloudflare
+```
+
+No additional `forward_proxy` Caddyfile option is needed. Enable UoT in a
+supporting client, for example in the sing-box `naive` outbound:
+
+```json
+"udp_over_tcp": {
+  "enabled": true,
+  "version": 2
+}
+```
+
+This is the SagerNet extension used by sing-box, not MASQUE CONNECT-UDP or
+native UDP support for every standalone NaiveProxy client. With HTTP/2, UDP
+payloads travel inside the existing TCP/TLS connection; the server needs
+outbound UDP connectivity to the requested destinations, with no extra inbound
+UDP listener for UoT. HTTP/3 uses QUIC as its outer transport instead.
+
+Real UDP destination domains, resolved IPs and ports use the existing ACL and
+`ports` restrictions. The magic address's port (normally 0) is not the target
+UDP port. Upstream proxies receive the original magic CONNECT request and must
+support UoT at the final hop. Tunnels close on malformed input, denied targets,
+fixed-target I/O errors, client disconnect, or two minutes without traffic.
+In multi-target mode, denied/unresolvable destinations are dropped without
+interrupting other traffic. One UDP socket preserves the local source port
+across targets; a bounded 256-entry policy/DNS cache expires entries after one
+minute. Fixed-target v2 mode uses a connected UDP socket. Empty UDP datagrams,
+65,000-byte payloads and both v2 connect/non-connect framing are tested.
 
 
 ## Introduction
