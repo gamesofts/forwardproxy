@@ -129,7 +129,7 @@ func TestUOTHTTP2(t *testing.T) {
 						buffer := make([]byte, 65535)
 						n, _, err := packets.ReadFrom(buffer)
 						if err != nil {
-							t.Fatal(err)
+							t.Fatalf("packet %d (%d bytes): %v", i, len(payload), err)
 						}
 						if !bytes.Equal(buffer[:n], payload) {
 							t.Fatalf("packet %d changed", i)

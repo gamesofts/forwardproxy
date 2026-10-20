@@ -150,7 +150,7 @@ func (h Handler) serveUOT(ctx context.Context, stream net.Conn, version int) {
 		}
 		touch()
 		if connected != nil {
-			if n, err := connected.Write(buffer.Bytes()); err != nil || n != buffer.Len() {
+			if n, err := writeUOTConnected(connected, buffer.Bytes()); err != nil || n != buffer.Len() {
 				return
 			}
 			continue
@@ -194,4 +194,18 @@ func (s *uotConnectedSocket) ReadFrom(p []byte) (int, net.Addr, error) {
 	return n, s.RemoteAddr(), err
 }
 
-func (s *uotConnectedSocket) WriteTo(p []byte, _ net.Addr) (int, error) { return s.Write(p) }
+func (s *uotConnectedSocket) WriteTo(p []byte, _ net.Addr) (int, error) {
+	return writeUOTConnected(s.Conn, p)
+}
+
+func writeUOTConnected(conn net.Conn, payload []byte) (int, error) {
+	// Windows' generic FD.Write loop skips empty slices. WriteMsgUDP must
+	// issue a real send operation so an empty UDP datagram is not swallowed.
+	if len(payload) == 0 {
+		if udp, ok := conn.(*net.UDPConn); ok {
+			n, _, err := udp.WriteMsgUDP(payload, nil, nil)
+			return n, err
+		}
+	}
+	return conn.Write(payload)
+}
