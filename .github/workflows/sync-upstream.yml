@@ -38,8 +38,7 @@ jobs:
       - uses: actions/setup-go@v6
         if: steps.merge.outputs.changed == 'true'
         with:
-          go-version: '1.26.x'
-          cache: false
+          go-version-file: go.mod
       # GITHUB_TOKEN-created PRs do not trigger other workflows. Validate here
       # before pushing and link this run from the PR description.
       - name: Test merged code
