@@ -14,9 +14,8 @@ on:
     paths:
       - '.github/workflows/caddy-release.yml'
       - '.github/scripts/*caddy*'
+      - 'caddy-read-idle-timeout.patch'
       - '.github/tests/*caddy_release.py'
-      - 'CADDY_VERSION'
-      - 'caddy-*.patch'
   pull_request:
     branches: [naive]
     paths:
@@ -25,9 +24,8 @@ on:
       - 'go.sum'
       - '.github/workflows/caddy-release.yml'
       - '.github/scripts/*caddy*'
+      - 'caddy-read-idle-timeout.patch'
       - '.github/tests/*caddy_release.py'
-      - 'CADDY_VERSION'
-      - 'caddy-*.patch'
 
 permissions:
   contents: read
