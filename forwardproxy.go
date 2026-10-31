@@ -281,7 +281,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			fmt.Errorf("unsupported HTTP major version: %d", r.ProtoMajor))
 	}
 
-	ctx := context.Background()
+	ctx := r.Context()
 	if !h.HideIP {
 		ctxHeader := make(http.Header)
 		for k, v := range r.Header {
@@ -348,11 +348,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		case 2: // http2: keep reading from "request" and writing into same response
 			fallthrough
 		case 3:
-			// Allow authenticated tunnels to remain idle for up to 24 hours.
-			// This reader belongs to this CONNECT request; hard deadlines still apply.
+			// The patched Caddy build exposes Override on its idle-timeout reader.
+			// Use a structural interface so stock Caddy dependencies used by the
+			// module test matrix continue to compile.
 			if len(h.AuthCredentials) > 0 {
-				if reader, _ := caddyhttp.IdleTimeoutsFromContext(r.Context()); reader != nil {
-					reader.Override(86400*time.Second, 0)
+				if reader, ok := r.Body.(interface {
+					Override(time.Duration, int64) func()
+				}); ok {
+					reader.Override(24*time.Hour, 0)
 				}
 			}
 			defer r.Body.Close()
@@ -509,7 +512,7 @@ func (h Handler) servePacFile(w http.ResponseWriter, r *http.Request) error {
 func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort string) (net.Conn, error) {
 	var conn net.Conn
 
-	if network != "tcp" && network != "tcp4" && network != "tcp6" {
+	if network != "tcp" && network != "tcp4" && network != "tcp6" && network != "udp" {
 		// return nil, &proxyError{S: "Network " + network + " is not supported", Code: http.StatusBadRequest}
 		return nil, caddyhttp.Error(http.StatusBadRequest,
 			fmt.Errorf("network %s is not supported", network))
@@ -531,6 +534,29 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 		return conn, nil
 	}
 
+	// UoT's magic destination is a protocol marker, not a DNS name or real
+	// destination port. Check ACLs on each encapsulated UDP destination instead.
+	if version, ok := uotVersion(host); ok && network == "tcp" {
+		return h.dialUOT(ctx, version), nil
+	}
+
+	IPs, err := h.lookupAllowedIPs(ctx, host, port)
+	if err != nil {
+		return nil, err
+	}
+	// As with net.Dial, try each permitted IP until a connection succeeds.
+	for _, ip := range IPs {
+		conn, err = h.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+	}
+	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
+}
+
+// lookupAllowedIPs applies the same domain, IP and port policy to TCP and UoT.
+// Callers must use the returned IPs directly, without resolving the name again.
+func (h Handler) lookupAllowedIPs(ctx context.Context, host, port string) ([]net.IP, error) {
 	if !h.portIsAllowed(port) {
 		// return nil, &proxyError{S: "port " + port + " is not allowed", Code: http.StatusForbidden}
 		return nil, caddyhttp.Error(http.StatusForbidden,
@@ -549,8 +575,7 @@ match:
 		}
 	}
 
-	// in case IP was provided, net.LookupIP will simply return it
-	IPs, err := net.LookupIP(host)
+	IPs, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
 		// return nil, &proxyError{S: fmt.Sprintf("Lookup of %s failed: %v", host, err),
 		// Code: http.StatusBadGateway}
@@ -558,19 +583,15 @@ match:
 			fmt.Errorf("lookup of %s failed: %v", host, err))
 	}
 
-	// This is net.Dial's default behavior: if the host resolves to multiple IP addresses,
-	// Dial will try each IP address in order until one succeeds
+	var allowed []net.IP
 	for _, ip := range IPs {
-		if !h.hostIsAllowed(host, ip) {
-			continue
-		}
-
-		conn, err = h.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
-		if err == nil {
-			return conn, nil
+		if h.hostIsAllowed(host, ip) {
+			allowed = append(allowed, ip)
 		}
 	}
-
+	if len(allowed) > 0 {
+		return allowed, nil
+	}
 	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
 }
 
