@@ -348,6 +348,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		case 2: // http2: keep reading from "request" and writing into same response
 			fallthrough
 		case 3:
+			// The patched Caddy build exposes Override on its idle-timeout reader.
+			// Use a structural interface so stock Caddy dependencies used by the
+			// module test matrix continue to compile.
+			if len(h.AuthCredentials) > 0 {
+				if reader, ok := r.Body.(interface {
+					Override(time.Duration, int64) func()
+				}); ok {
+					reader.Override(24*time.Hour, 0)
+				}
+			}
 			defer r.Body.Close()
 			return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "")
 		}
