@@ -9,10 +9,18 @@ on:
         description: 'Stable Caddy tag (e.g. v2.11.7); leave empty for latest'
         required: false
         type: string
+      rebuild_current:
+        description: 'Build a source-specific release even when this Caddy version is already published'
+        required: false
+        default: true
+        type: boolean
   push:
     branches: [naive]
     paths:
       - '.github/workflows/caddy-release.yml'
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
       - '.github/scripts/*caddy*'
       - '.github/tests/*caddy_release.py'
   pull_request:
@@ -61,6 +69,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_VERSION: ${{ inputs.caddy_version }}
+          REBUILD_CURRENT: ${{ inputs.rebuild_current }}
         run: |
           export SOURCE_SHA=$(git rev-parse HEAD)
           python3 .github/scripts/detect-caddy-release.py
