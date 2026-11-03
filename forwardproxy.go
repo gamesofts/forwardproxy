@@ -153,14 +153,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			h.aclRules = append(h.aclRules, ar)
 		}
 	}
-	for _, ipDeny := range []string{
-		"10.0.0.0/8",
-		"127.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"::1/128",
-		"fe80::/10",
-	} {
+	for _, ipDeny := range defaultDeniedIPRanges {
 		ar, err := newACLRule(ipDeny, false)
 		if err != nil {
 			return err
@@ -344,7 +337,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 		switch r.ProtoMajor {
 		case 1: // http1: hijack the whole flow
-			return serveHijack(w, targetConn)
+			return serveHijack(w, targetConn, r.Header.Get("Padding") != "")
 		case 2: // http2: keep reading from "request" and writing into same response
 			fallthrough
 		case 3:
@@ -646,7 +639,7 @@ func serveHiddenPage(w http.ResponseWriter, authErr error) error {
 
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
 // and hijacked connection.
-func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
+func serveHijack(w http.ResponseWriter, targetConn net.Conn, padding bool) error {
 	w.WriteHeader(http.StatusOK)
 	clientConn, brw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
@@ -654,19 +647,15 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
 			fmt.Errorf("hijack failed: %v", err))
 	}
 	defer clientConn.Close()
-	// bufReader may contain unprocessed buffered data from the client.
-	// snippet borrowed from `proxy` plugin
-	if n := brw.Reader.Buffered(); n > 0 {
-		rbuf, _ := brw.Peek(n)
-		_, _ = targetConn.Write(rbuf)
-	}
-	err = brw.Flush()
-	if err != nil {
+	// Read tunnel bytes through the hijacked buffered reader, including any
+	// bytes pre-fetched with the CONNECT request. Never forward them before
+	// Naive padding has been decoded.
+	if err := brw.Flush(); err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError,
 			fmt.Errorf("failed to flush to client: %v", err))
 	}
 
-	return dualStream(targetConn, clientConn, clientConn, false)
+	return dualStream(targetConn, io.NopCloser(brw.Reader), clientConn, padding)
 }
 
 const (
