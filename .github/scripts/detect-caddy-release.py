@@ -38,7 +38,7 @@ def find_release(repository, tag):
         page += 1
 
 
-def select_release(upstream, existing):
+def select_release(upstream, existing, revision=""):
     if upstream is None:
         raise ValueError("Caddy release does not exist")
     version = upstream["tag_name"]
@@ -46,8 +46,12 @@ def select_release(upstream, existing):
         raise ValueError(f"Not a stable Caddy v2 tag: {version}")
     if upstream.get("draft") or upstream.get("prerelease"):
         raise ValueError("Draft and prerelease Caddy versions are not published")
-    tag = f"caddy-{version}"
-    archive = f"caddy-{version}-linux-amd64.tar.gz"
+    if revision and not re.fullmatch(r"[0-9a-f]{12}", revision):
+        raise ValueError("Invalid source revision")
+    # Keep existing Caddy-only tags immutable. Plugin updates get a distinct
+    # source-specific release, even when the upstream Caddy tag is unchanged.
+    tag = f"caddy-{version}" + (f"-naive-{revision}" if revision else "")
+    archive = f"{tag}-linux-amd64.tar.gz"
     complete = False
     if existing is not None and not existing.get("draft"):
         assets = {asset["name"] for asset in existing.get("assets", [])}
@@ -72,11 +76,35 @@ def main():
     # Validate before inserting an upstream tag into a REST path.
     selection = select_release(upstream, None)
     repository = os.environ["GITHUB_REPOSITORY"]
-    existing = find_release(repository, selection["tag"])
-    selection = select_release(upstream, existing)
     source_sha = os.environ["SOURCE_SHA"]
+    if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+        raise ValueError("Release source must be an immutable commit SHA")
+    event_name = os.environ.get("GITHUB_EVENT_NAME")
+    original = find_release(repository, selection["tag"])
+    existing = original
+    revision = ""
+
+    # The original Caddy release is immutable. When this fork has moved on,
+    # publish a new version identified by its source SHA rather than skipping
+    # a required rebuild or silently overwriting an older executable.
+    # PRs only validate builds and never select a publication revision.
+    force_rebuild = event_name == "workflow_dispatch" and os.environ.get("REBUILD_CURRENT", "").lower() == "true"
+    if (
+        event_name != "pull_request"
+        and original is not None
+        and not original.get("draft")
+        and (original.get("target_commitish") != source_sha or force_rebuild)
+    ):
+        revision = source_sha[:12]
+        new_tag = select_release(upstream, None, revision=revision)["tag"]
+        existing = find_release(repository, new_tag)
+        if existing is not None and existing.get("target_commitish") != source_sha:
+            raise ValueError("Revision tag is already associated with another source commit")
+
+    selection = select_release(upstream, existing, revision=revision)
+
     # Retry a partial draft using the same source snapshot as its first build.
-    if existing is not None and existing.get("draft") and os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
+    if existing is not None and existing.get("draft") and event_name != "pull_request":
         source_sha = existing.get("target_commitish", "")
     if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
         raise ValueError("Release source must be an immutable commit SHA")
@@ -95,7 +123,11 @@ def main():
         for key, value in selection.items():
             output.write(f"{key}={value}\n")
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-        summary.write(f"Caddy {selection['version']}: build required = {selection['should_build']}.\n")
+        summary.write(
+            f"Caddy {selection['version']}, release {selection['tag']}, "
+            f"source {selection['source_sha'][:12]}: "
+            f"build required = {selection['should_build']}.\n"
+        )
 
 
 if __name__ == "__main__":

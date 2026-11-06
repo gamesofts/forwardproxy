@@ -30,6 +30,124 @@ class ReleaseDetectionTests(unittest.TestCase):
         ]}
         self.assertEqual(detect.select_release(self.upstream, existing)["should_build"], "false")
 
+    def test_revision_release_has_distinct_immutable_tag(self):
+        result = detect.select_release(self.upstream, None, revision="abcdef123456")
+        self.assertEqual(result["tag"], "caddy-v2.11.7-naive-abcdef123456")
+        self.assertEqual(result["archive"], "caddy-v2.11.7-naive-abcdef123456-linux-amd64.tar.gz")
+        self.assertEqual(result["should_build"], "true")
+
+    def test_published_source_revision_is_not_rebuilt(self):
+        existing = {
+            "draft": False,
+            "target_commitish": "a" * 40,
+            "assets": [
+                {"name": "caddy-v2.11.7-naive-aaaaaaaaaaaa-linux-amd64.tar.gz"},
+                {"name": "SHA256SUMS"},
+            ],
+        }
+        result = detect.select_release(self.upstream, existing, revision="aaaaaaaaaaaa")
+        self.assertEqual(result["should_build"], "false")
+
+    def test_invalid_revision_is_rejected(self):
+        for revision in ("A" * 12, "a" * 11, "../unsafe", "a" * 13):
+            with self.subTest(revision=revision), self.assertRaises(ValueError):
+                detect.select_release(self.upstream, None, revision=revision)
+
+    def test_new_fork_source_publishes_new_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "outputs"
+            summary = Path(directory) / "summary"
+            module = {"content": base64.b64encode(b"module caddy\n\ngo 1.26.0\n").decode()}
+            original = {
+                "draft": False,
+                "target_commitish": "b" * 40,
+                "assets": [
+                    {"name": "caddy-v2.11.7-linux-amd64.tar.gz"},
+                    {"name": "SHA256SUMS"},
+                ],
+            }
+            env = {
+                "REQUESTED_VERSION": "",
+                "SOURCE_SHA": "a" * 40,
+                "GITHUB_EVENT_NAME": "schedule",
+                "GITHUB_REPOSITORY": "gamesofts/forwardproxy",
+                "GITHUB_OUTPUT": str(output),
+                "GITHUB_STEP_SUMMARY": str(summary),
+            }
+            with patch.dict(os.environ, env), patch.object(
+                detect, "gh_api", side_effect=[self.upstream, module]
+            ), patch.object(detect, "find_release", side_effect=[original, None]) as lookup:
+                detect.main()
+            result = output.read_text()
+            self.assertIn("tag=caddy-v2.11.7-naive-aaaaaaaaaaaa", result)
+            self.assertIn("archive=caddy-v2.11.7-naive-aaaaaaaaaaaa-linux-amd64.tar.gz", result)
+            self.assertIn("source_sha=" + "a" * 40, result)
+            self.assertIn("should_build=true", result)
+            self.assertIn("release_exists=false", result)
+            self.assertEqual(lookup.call_count, 2)
+
+    def test_manual_rebuild_current_source_creates_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "outputs"
+            summary = Path(directory) / "summary"
+            module = {"content": base64.b64encode(b"module caddy\n\ngo 1.26.0\n").decode()}
+            original = {
+                "draft": False,
+                "target_commitish": "a" * 40,
+                "assets": [
+                    {"name": "caddy-v2.11.7-linux-amd64.tar.gz"},
+                    {"name": "SHA256SUMS"},
+                ],
+            }
+            env = {
+                "REQUESTED_VERSION": "",
+                "REBUILD_CURRENT": "true",
+                "SOURCE_SHA": "a" * 40,
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+                "GITHUB_REPOSITORY": "gamesofts/forwardproxy",
+                "GITHUB_OUTPUT": str(output),
+                "GITHUB_STEP_SUMMARY": str(summary),
+            }
+            with patch.dict(os.environ, env), patch.object(
+                detect, "gh_api", side_effect=[self.upstream, module]
+            ), patch.object(detect, "find_release", side_effect=[original, None]):
+                detect.main()
+            self.assertIn("tag=caddy-v2.11.7-naive-aaaaaaaaaaaa", output.read_text())
+            self.assertIn("should_build=true", output.read_text())
+
+    def test_revision_tag_cannot_be_reused_for_another_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            module = {"content": base64.b64encode(b"module caddy\n\ngo 1.26.0\n").decode()}
+            original = {
+                "draft": False,
+                "target_commitish": "b" * 40,
+                "assets": [
+                    {"name": "caddy-v2.11.7-linux-amd64.tar.gz"},
+                    {"name": "SHA256SUMS"},
+                ],
+            }
+            revision = {
+                "draft": False,
+                "target_commitish": "a" * 12 + "b" * 28,
+                "assets": [
+                    {"name": "caddy-v2.11.7-naive-aaaaaaaaaaaa-linux-amd64.tar.gz"},
+                    {"name": "SHA256SUMS"},
+                ],
+            }
+            env = {
+                "REQUESTED_VERSION": "",
+                "SOURCE_SHA": "a" * 40,
+                "GITHUB_EVENT_NAME": "schedule",
+                "GITHUB_REPOSITORY": "gamesofts/forwardproxy",
+                "GITHUB_OUTPUT": str(Path(directory) / "outputs"),
+                "GITHUB_STEP_SUMMARY": str(Path(directory) / "summary"),
+            }
+            with patch.dict(os.environ, env), patch.object(
+                detect, "gh_api", side_effect=[self.upstream, module]
+            ), patch.object(detect, "find_release", side_effect=[original, revision]):
+                with self.assertRaises(ValueError):
+                    detect.main()
+
     def test_partial_draft_is_retried(self):
         result = detect.select_release(self.upstream, {"draft": True, "assets": []})
         self.assertEqual(result["should_build"], "true")
