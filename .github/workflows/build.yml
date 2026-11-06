@@ -6,8 +6,6 @@ on:
   pull_request:
     branches: [naive]
     paths-ignore: ["**.md"]
-  release:
-    types: [published]
 defaults:
   run:
     shell: bash
@@ -15,8 +13,6 @@ permissions:
   contents: read
 jobs:
   build_caddy_with_naive:
-    permissions:
-      contents: write # Required for release uploads; PRs from forks remain read-only.
     runs-on: ubuntu-22.04
     env:
       BUNDLE: caddy-forwardproxy-naive
@@ -39,8 +35,3 @@ jobs:
           path: |
             sha256sum.txt
             caddy-forwardproxy-naive.tar.xz
-      - name: Upload caddy assets
-        if: ${{ github.event_name == 'release' }}
-        run: gh release upload "${GITHUB_REF##*/}"  ${{ env.BUNDLE }}.tar.xz --clobber
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
