@@ -184,47 +184,6 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.Upstream = args[0]
 
-		case "acl":
-			for nesting := d.Nesting(); d.NextBlock(nesting); {
-				aclDirective := d.Val()
-				args := d.RemainingArgs()
-				if len(args) == 0 {
-					return d.ArgErr()
-				}
-				var ruleSubjects []string
-				var err error
-				aclAllow := false
-				switch aclDirective {
-				case "allow":
-					ruleSubjects = args
-					aclAllow = true
-				case "allow_file":
-					if len(args) != 1 {
-						return d.Err("allowfile accepts a single filename argument")
-					}
-					ruleSubjects, err = readLinesFromFile(args[0])
-					if err != nil {
-						return err
-					}
-					aclAllow = true
-				case "deny":
-					ruleSubjects = args
-				case "deny_file":
-					if len(args) != 1 {
-						return d.Err("denyfile accepts a single filename argument")
-					}
-					ruleSubjects, err = readLinesFromFile(args[0])
-					if err != nil {
-						return err
-					}
-				default:
-					return d.Err("expected acl directive: allow/allowfile/deny/denyfile." +
-						"got: " + aclDirective)
-				}
-				ar := ACLRule{Subjects: ruleSubjects, Allow: aclAllow}
-				h.ACL = append(h.ACL, ar)
-			}
-
 		default:
 			return d.ArgErr()
 		}

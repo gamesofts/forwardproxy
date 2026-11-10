@@ -16,89 +16,47 @@ import (
 	"github.com/caddyserver/caddy/v2"
 )
 
-func TestDefaultSpecialUseIPRanges(t *testing.T) {
-	h := Handler{}
-	for _, cidr := range defaultDeniedIPRanges {
-		rule, err := newACLRule(cidr, false)
-		if err != nil {
-			t.Fatalf("invalid default CIDR %q: %v", cidr, err)
-		}
-		h.aclRules = append(h.aclRules, rule)
-	}
-	h.aclRules = append(h.aclRules, &aclAllRule{allow: true})
-
-	tests := []struct {
-		address string
-		allow   bool
-	}{
-		{"0.0.0.1", false},
-		{"10.0.0.1", false},
-		{"100.100.100.100", false},
-		{"127.0.0.1", false},
-		{"169.254.169.254", false},
-		{"172.16.0.1", false},
-		{"192.0.0.8", false},
-		{"192.0.2.1", false},
-		{"192.88.99.1", false},
-		{"192.168.1.1", false},
-		{"198.18.0.1", false},
-		{"198.51.100.1", false},
-		{"203.0.113.1", false},
-		{"224.0.0.1", false},
-		{"240.0.0.1", false},
-		{"255.255.255.255", false},
-		{"::", false},
-		{"::1", false},
-		{"64:ff9b::a9fe:a9fe", false},
-		{"100::1", false},
-		{"2001::1", false},
-		{"2001:db8::1", false},
-		{"2002:c0a8:0101::1", false},
-		{"fc00::1", false},
-		{"fd12::1", false},
-		{"fe80::1", false},
-		{"ff02::1", false},
-		{"::ffff:169.254.169.254", false},
-		{"1.1.1.1", true},
-		{"8.8.8.8", true},
-		{"2606:4700:4700::1111", true},
-		{"2001:4860:4860::8888", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.address, func(t *testing.T) {
-			ip := net.ParseIP(tt.address)
-			if ip == nil {
-				t.Fatal("invalid test IP")
-			}
-			if got := h.hostIsAllowed(tt.address, ip); got != tt.allow {
-				t.Fatalf("address %s allowed=%t; want %t", tt.address, got, tt.allow)
-			}
-		})
-	}
-
-	// Explicit user exceptions must continue to take precedence.
-	rule, err := newACLRule("169.254.169.254", true)
+// Hostnames and IP literals both reach Go's native dialer without an IP ACL.
+func TestNativeDialDomainAndLiteralIP(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.aclRules = append([]aclRule{rule}, h.aclRules...)
-	if !h.hostIsAllowed("169.254.169.254", net.ParseIP("169.254.169.254")) {
-		t.Fatal("explicit allow rule was overridden by defaults")
-	}
-}
-
-func TestDefaultSpecialUseIPBlockedViaProxy(t *testing.T) {
-	for _, address := range []string{"169.254.169.254", "100.64.0.1", "fc00::1"} {
-		t.Run(address, func(t *testing.T) {
-			resp, err := getViaProxy(net.JoinHostPort(address, "80"), "/", caddyForwardProxyNoBlacklistOverride.addr, "HTTP/1.1", "", true)
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(listener.Addr().String())
+	h := uotTestHandler()
+	for _, host := range []string{"localhost", "127.0.0.1"} {
+		t.Run(host, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			conn, err := h.dialTarget(ctx, "tcp", net.JoinHostPort(host, port))
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusForbidden {
-				t.Fatalf("request to %s returned %d; want 403", address, resp.StatusCode)
-			}
+			_ = conn.Close()
 		})
+	}
+}
+
+func TestDialTargetRejectsBlockedPortWithoutDNS(t *testing.T) {
+	h := &Handler{
+		AllowedPorts: []int{443},
+		dialContext: func(context.Context, string, string) (net.Conn, error) {
+			t.Fatal("blocked port reached the dialer")
+			return nil, nil
+		},
+	}
+	if _, err := h.dialTarget(context.Background(), "tcp", "example.invalid:80"); err == nil {
+		t.Fatal("blocked port was accepted")
 	}
 }
 

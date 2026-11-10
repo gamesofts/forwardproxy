@@ -23,7 +23,6 @@ func uotTestHandler() *Handler {
 	return &Handler{
 		HideIP:          true,
 		AuthCredentials: [][]byte{EncodeAuthCredentials("test", "pass")},
-		aclRules:        []aclRule{&aclAllRule{allow: true}},
 		dialContext:     (&net.Dialer{Timeout: time.Second}).DialContext,
 	}
 }
@@ -191,7 +190,7 @@ func TestUOTUpstream(t *testing.T) {
 		}
 		return conn, nil
 	}
-	got, err := h.dialContextCheckACL(context.Background(), "tcp", uot.MagicAddress+":0")
+	got, err := h.dialTarget(context.Background(), "tcp", uot.MagicAddress+":0")
 	if err != nil || got != conn {
 		t.Fatalf("UoT was not delegated to upstream: %v", err)
 	}
@@ -201,8 +200,6 @@ func TestUOTMultiTargetPolicyAndSourcePort(t *testing.T) {
 	first := M.SocksaddrFromNet(uotEchoServer(t, "127.0.0.1:0"))
 	second := M.SocksaddrFromNet(uotEchoServer(t, "127.0.0.1:0"))
 	h := uotTestHandler()
-	rule, _ := newACLRule("localhost", false)
-	h.aclRules = append([]aclRule{rule}, h.aclRules...)
 	h.AllowedPorts = []int{int(first.Port), int(second.Port)}
 	conn := h.dialUOT(context.Background(), uot.Version)
 	defer conn.Close()
@@ -211,12 +208,7 @@ func TestUOTMultiTargetPolicyAndSourcePort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A forbidden domain resolving to the same allowed IP must still be denied.
-	denied := M.ParseSocksaddrHostPort("localhost", first.Port)
-	if _, err := packets.WriteTo([]byte("domain denied"), denied); err != nil {
-		t.Fatal(err)
-	}
-	// Exercise more destinations than the cache can hold; denied packets must
+	// Exercise more destinations than the cache can hold; blocked-port packets must
 	// not desynchronize framing, grow the cache, or terminate the tunnel.
 	for port := 1; port <= uotCacheSize+10; port++ {
 		_, err := packets.WriteTo([]byte("port denied"), M.ParseSocksaddrHostPort("127.0.0.1", uint16(port)))
@@ -368,51 +360,35 @@ func TestUOTIdleTimeout(t *testing.T) {
 	}
 }
 
-func TestUOTAccessControl(t *testing.T) {
+func TestUOTPortRestriction(t *testing.T) {
 	destination := M.SocksaddrFromNet(uotEchoServer(t, "127.0.0.1:0"))
-	for _, policy := range []string{"ip", "domain", "port"} {
-		t.Run(policy, func(t *testing.T) {
-			h := uotTestHandler()
-			target := destination
-			switch policy {
-			case "ip":
-				rule, _ := newACLRule("127.0.0.0/8", false)
-				h.aclRules = append([]aclRule{rule}, h.aclRules...)
-			case "domain":
-				rule, _ := newACLRule("localhost", false)
-				h.aclRules = append([]aclRule{rule}, h.aclRules...)
-				target = M.ParseSocksaddrHostPort("localhost", destination.Port)
-			case "port":
-				h.AllowedPorts = []int{int(destination.Port) + 1}
-			}
-			dialed := false
-			h.dialContext = func(context.Context, string, string) (net.Conn, error) {
-				dialed = true
-				return nil, fmt.Errorf("must not dial denied destination")
-			}
-			conn, err := h.dialContextCheckACL(context.Background(), "tcp", uot.MagicAddress+":0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer conn.Close()
-			_ = conn.SetDeadline(time.Now().Add(time.Second))
-			packets, err := (&uot.Client{Version: 2}).DialConn(conn, true, target)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, _ = packets.Write([]byte("denied"))
-			_, err = packets.Read(make([]byte, 128))
-			if err == nil {
-				t.Fatal("denied UDP destination returned data")
-			}
-			if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
-				t.Fatal("denied session did not close")
-			}
-			// stream close synchronizes the server's completed ACL check.
-			if dialed {
-				t.Fatal("ACL was bypassed")
-			}
-		})
+	h := uotTestHandler()
+	h.AllowedPorts = []int{int(destination.Port) + 1}
+	dialed := false
+	h.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		dialed = true
+		return nil, fmt.Errorf("blocked port reached the dialer")
+	}
+	conn, err := h.dialTarget(context.Background(), "tcp", uot.MagicAddress+":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(time.Second))
+	packets, err := (&uot.Client{Version: 2}).DialConn(conn, true, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = packets.Write([]byte("blocked"))
+	_, err = packets.Read(make([]byte, 128))
+	if err == nil {
+		t.Fatal("blocked UDP port returned data")
+	}
+	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatal("blocked UDP session did not close")
+	}
+	if dialed {
+		t.Fatal("blocked UDP port was dialed")
 	}
 }
 

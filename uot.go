@@ -100,7 +100,7 @@ func (h Handler) serveUOT(ctx context.Context, stream net.Conn, version int) {
 	if request.IsConnect {
 		// A fixed destination benefits from kernel source filtering and avoids
 		// per-packet resolution, ACL checks and address serialization.
-		connected, err = h.dialContextCheckACL(ctx, "udp", request.Destination.String())
+		connected, err = h.dialTarget(ctx, "udp", request.Destination.String())
 		if err != nil || connected == nil {
 			return
 		}
@@ -159,9 +159,15 @@ func (h Handler) serveUOT(ctx context.Context, stream net.Conn, version int) {
 		now := time.Now()
 		if !cached || now.After(entry.expires) {
 			entry = uotCachedDestination{expires: now.Add(uotCacheTTL)}
-			IPs, err := h.lookupAllowedIPs(ctx, destination.AddrString(), strconv.Itoa(int(destination.Port)))
-			if err == nil {
-				entry.address = &net.UDPAddr{IP: IPs[0], Port: int(destination.Port)}
+			// Preserve port restrictions without resolving IPs for TCP ACL checks.
+			// UDP has no handshake to race: use Go's ordered DNS result.
+			if h.portIsAllowed(strconv.Itoa(int(destination.Port))) {
+				addresses, err := net.DefaultResolver.LookupIPAddr(ctx, destination.AddrString())
+				if err == nil && len(addresses) > 0 {
+					entry.address = &net.UDPAddr{
+						IP: addresses[0].IP, Zone: addresses[0].Zone, Port: int(destination.Port),
+					}
+				}
 			}
 			// Keep the cache bounded, recycling expired destinations when full.
 			// A full cache of live entries does not prevent forwarding uncached packets.

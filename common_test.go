@@ -51,12 +51,6 @@ var (
 	}
 )
 
-var (
-	blacklistedDomain = "google-public-dns-a.google.com" // supposed to ever resolve to one of 2 IP addresses below
-	blacklistedIPv4   = "8.8.8.8"
-	blacklistedIPv6   = "2001:4860:4860::8888"
-)
-
 type caddyTestServer struct {
 	addr string
 	tls  bool
@@ -76,14 +70,11 @@ var (
 	caddyForwardProxyProbeResist caddyTestServer // requires auth, and has probing resistance on
 	caddyDummyProbeResist        caddyTestServer // same as caddyForwardProxyProbeResist, but w/o forwardproxy
 
-	caddyForwardProxyWhiteListing        caddyTestServer
-	caddyForwardProxyBlackListing        caddyTestServer
-	caddyForwardProxyNoBlacklistOverride caddyTestServer // to test default blacklist
 
 	// authenticated server upstreams to authenticated https proxy with different credentials
 	caddyAuthedUpstreamEnter caddyTestServer
 
-	caddyTestTarget     caddyTestServer // whitelisted by caddyForwardProxyWhiteListing
+	caddyTestTarget     caddyTestServer
 	caddyHTTPTestTarget caddyTestServer // serves plain http on 6480
 )
 
@@ -191,7 +182,6 @@ func TestMain(m *testing.M) {
 		tls:  true,
 		proxyHandler: &Handler{
 			PACPath: defaultPACPath,
-			ACL:     []ACLRule{{Allow: true, Subjects: []string{"all"}}},
 		},
 	}
 
@@ -201,7 +191,6 @@ func TestMain(m *testing.M) {
 		tls:  true,
 		proxyHandler: &Handler{
 			PACPath:         defaultPACPath,
-			ACL:             []ACLRule{{Subjects: []string{"all"}, Allow: true}},
 			AuthCredentials: [][]byte{EncodeAuthCredentials("test", "pass")},
 		},
 	}
@@ -211,7 +200,6 @@ func TestMain(m *testing.M) {
 		root: "./test/forwardproxy",
 		proxyHandler: &Handler{
 			PACPath:         defaultPACPath,
-			ACL:             []ACLRule{{Subjects: []string{"all"}, Allow: true}},
 			AuthCredentials: [][]byte{EncodeAuthCredentials("test", "pass")},
 		},
 	}
@@ -222,7 +210,6 @@ func TestMain(m *testing.M) {
 		tls:  true,
 		proxyHandler: &Handler{
 			PACPath:         "/superhiddenfile.pac",
-			ACL:             []ACLRule{{Subjects: []string{"all"}, Allow: true}},
 			ProbeResistance: &ProbeResistance{Domain: "test.localhost"},
 			AuthCredentials: [][]byte{EncodeAuthCredentials("test", "pass")},
 		},
@@ -256,39 +243,6 @@ func TestMain(m *testing.M) {
 		},
 	}
 
-	caddyForwardProxyWhiteListing = caddyTestServer{
-		addr: "127.0.87.76:8776",
-		root: "./test/forwardproxy",
-		tls:  true,
-		proxyHandler: &Handler{
-			ACL: []ACLRule{
-				{Subjects: []string{"127.0.64.51"}, Allow: true},
-				{Subjects: []string{"all"}, Allow: false},
-			},
-			AllowedPorts: []int{6451},
-		},
-	}
-
-	caddyForwardProxyBlackListing = caddyTestServer{
-		addr: "127.0.66.76:6676",
-		root: "./test/forwardproxy",
-		tls:  true,
-		proxyHandler: &Handler{
-			ACL: []ACLRule{
-				{Subjects: []string{blacklistedIPv4 + "/30"}, Allow: false},
-				{Subjects: []string{blacklistedIPv6}, Allow: false},
-				{Subjects: []string{"all"}, Allow: true},
-			},
-		},
-	}
-
-	caddyForwardProxyNoBlacklistOverride = caddyTestServer{
-		addr:         "127.0.66.76:6679",
-		root:         "./test/forwardproxy",
-		tls:          true,
-		proxyHandler: &Handler{},
-	}
-
 	// done configuring all the servers; now build the HTTP app
 	httpApp := caddyhttp.App{
 		HTTPPort: 1080, // use a high port to avoid permission issues
@@ -301,9 +255,6 @@ func TestMain(m *testing.M) {
 			"caddyTestTarget":                      caddyTestTarget.server(),
 			"caddyHTTPTestTarget":                  caddyHTTPTestTarget.server(),
 			"caddyAuthedUpstreamEnter":             caddyAuthedUpstreamEnter.server(),
-			"caddyForwardProxyWhiteListing":        caddyForwardProxyWhiteListing.server(),
-			"caddyForwardProxyBlackListing":        caddyForwardProxyBlackListing.server(),
-			"caddyForwardProxyNoBlacklistOverride": caddyForwardProxyNoBlacklistOverride.server(),
 
 			// HTTP->HTTPS redirect simulation servers for those which have a redir port configured
 			"caddyForwardProxyProbeResist_redir": caddyForwardProxyProbeResist.redirServer(),

@@ -30,8 +30,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,9 +89,6 @@ type Handler struct {
 	// Optionally configure an upstream proxy to use.
 	Upstream string `json:"upstream,omitempty"`
 
-	// Access control list.
-	ACL []ACLRule `json:"acl,omitempty"`
-
 	// Ports to be allowed to connect to (if non-empty).
 	AllowedPorts []int `json:"allowed_ports,omitempty"`
 
@@ -102,8 +97,6 @@ type Handler struct {
 	// overridden dialContext allows us to redirect requests to upstream proxy
 	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
 	upstream    *url.URL // address of upstream proxy
-
-	aclRules []aclRule
 
 	// TODO: temporary/deprecated - we should try to reuse existing authentication modules instead!
 	AuthCredentials [][]byte `json:"auth_credentials,omitempty"` // slice with base64-encoded credentials
@@ -143,25 +136,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
 
-	// access control lists
-	for _, rule := range h.ACL {
-		for _, subj := range rule.Subjects {
-			ar, err := newACLRule(subj, rule.Allow)
-			if err != nil {
-				return err
-			}
-			h.aclRules = append(h.aclRules, ar)
-		}
-	}
-	for _, ipDeny := range defaultDeniedIPRanges {
-		ar, err := newACLRule(ipDeny, false)
-		if err != nil {
-			return err
-		}
-		h.aclRules = append(h.aclRules, ar)
-	}
-	h.aclRules = append(h.aclRules, &aclAllRule{allow: true})
-
 	if h.ProbeResistance != nil {
 		if h.AuthCredentials == nil {
 			return fmt.Errorf("probe resistance requires authentication")
@@ -174,11 +148,10 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	dialer := &net.Dialer{
 		Timeout:   time.Duration(h.DialTimeout),
 		KeepAlive: 30 * time.Second,
-		DualStack: true,
 	}
 	h.dialContext = dialer.DialContext
 	h.httpTransport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		return h.dialContextCheckACL(ctx, network, address)
+		return h.dialTarget(ctx, network, address)
 	}
 
 	if h.Upstream != "" {
@@ -323,7 +296,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		if hostPort == "" {
 			hostPort = r.Host
 		}
-		targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
+		targetConn, err := h.dialTarget(ctx, "tcp", hostPort)
 		if err != nil {
 			return err
 		}
@@ -491,105 +464,39 @@ func (h Handler) servePacFile(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// dialContextCheckACL enforces Access Control List and calls fp.DialContext
-func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort string) (net.Conn, error) {
-	var conn net.Conn
-
+// dialTarget enforces the port policy but lets Go's native dialer resolve
+// hostnames and select/fallback between IPv4 and IPv6 addresses.
+func (h Handler) dialTarget(ctx context.Context, network, hostPort string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" && network != "tcp6" && network != "udp" {
-		// return nil, &proxyError{S: "Network " + network + " is not supported", Code: http.StatusBadRequest}
 		return nil, caddyhttp.Error(http.StatusBadRequest,
 			fmt.Errorf("network %s is not supported", network))
 	}
-
 	host, port, err := net.SplitHostPort(hostPort)
 	if err != nil {
-		// return nil, &proxyError{S: err.Error(), Code: http.StatusBadRequest}
 		return nil, caddyhttp.Error(http.StatusBadRequest, err)
 	}
-
+	// Upstream proxies receive the original destination (including UoT markers).
 	if h.upstream != nil {
-		// if upstreaming -- do not resolve locally nor check acl
-		conn, err = h.dialContext(ctx, network, hostPort)
+		conn, err := h.dialContext(ctx, network, hostPort)
 		if err != nil {
-			// return conn, &proxyError{S: err.Error(), Code: http.StatusBadGateway}
 			return conn, caddyhttp.Error(http.StatusBadGateway, err)
 		}
 		return conn, nil
 	}
-
-	// UoT's magic destination is a protocol marker, not a DNS name or real
-	// destination port. Check ACLs on each encapsulated UDP destination instead.
+	// UoT magic destinations are protocol markers, not DNS names or real ports.
 	if version, ok := uotVersion(host); ok && network == "tcp" {
 		return h.dialUOT(ctx, version), nil
 	}
-
-	IPs, err := h.lookupAllowedIPs(ctx, host, port)
-	if err != nil {
-		return nil, err
-	}
-	// As with net.Dial, try each permitted IP until a connection succeeds.
-	for _, ip := range IPs {
-		conn, err = h.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
-		if err == nil {
-			return conn, nil
-		}
-	}
-	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
-}
-
-// lookupAllowedIPs applies the same domain, IP and port policy to TCP and UoT.
-// Callers must use the returned IPs directly, without resolving the name again.
-func (h Handler) lookupAllowedIPs(ctx context.Context, host, port string) ([]net.IP, error) {
 	if !h.portIsAllowed(port) {
-		// return nil, &proxyError{S: "port " + port + " is not allowed", Code: http.StatusForbidden}
 		return nil, caddyhttp.Error(http.StatusForbidden,
 			fmt.Errorf("port %s is not allowed", port))
 	}
-
-match:
-	for _, rule := range h.aclRules {
-		if _, ok := rule.(*aclDomainRule); ok {
-			switch rule.tryMatch(nil, host) {
-			case aclDecisionDeny:
-				return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("disallowed host %s", host))
-			case aclDecisionAllow:
-				break match
-			}
-		}
-	}
-
-	IPs, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	conn, err := h.dialContext(ctx, network, hostPort)
 	if err != nil {
-		// return nil, &proxyError{S: fmt.Sprintf("Lookup of %s failed: %v", host, err),
-		// Code: http.StatusBadGateway}
 		return nil, caddyhttp.Error(http.StatusBadGateway,
-			fmt.Errorf("lookup of %s failed: %v", host, err))
+			fmt.Errorf("dial %s: %w", hostPort, err))
 	}
-
-	var allowed []net.IP
-	for _, ip := range IPs {
-		if h.hostIsAllowed(host, ip) {
-			allowed = append(allowed, ip)
-		}
-	}
-	if len(allowed) > 0 {
-		return allowed, nil
-	}
-	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
-}
-
-func (h Handler) hostIsAllowed(hostname string, ip net.IP) bool {
-	for _, rule := range h.aclRules {
-		switch rule.tryMatch(ip, hostname) {
-		case aclDecisionDeny:
-			return false
-		case aclDecisionAllow:
-			return true
-		}
-	}
-	// TODO: convert this to log entry
-	// fmt.Println("ERROR: no acl match for ", hostname, ip) // shouldn't happen
-	return false
+	return conn, nil
 }
 
 func (h Handler) portIsAllowed(port string) bool {
@@ -839,23 +746,6 @@ type dialContexter interface {
 // ProbeResistance configures probe resistance.
 type ProbeResistance struct {
 	Domain string `json:"domain,omitempty"`
-}
-
-func readLinesFromFile(filename string) ([]string, error) {
-	cleanFilename := filepath.Clean(filename)
-	file, err := os.Open(cleanFilename)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var hostnames []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		hostnames = append(hostnames, scanner.Text())
-	}
-
-	return hostnames, scanner.Err()
 }
 
 // Interface guards

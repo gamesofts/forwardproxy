@@ -20,7 +20,6 @@ We are also seeking experienced maintainers who have experience with these kinds
 
 - HTTP/1.1, HTTP/2, and HTTP/3 support
 - Authentication
-- Access control lists
 - Optional probe resistance
 - PAC file
 - Naive-compatible SagerNet UDP over TCP (UoT v1 and v2)
@@ -56,15 +55,15 @@ payloads travel inside the existing TCP/TLS connection; the server needs
 outbound UDP connectivity to the requested destinations, with no extra inbound
 UDP listener for UoT. HTTP/3 uses QUIC as its outer transport instead.
 
-Real UDP destination domains, resolved IPs and ports use the existing ACL and
-`ports` restrictions. The magic address's port (normally 0) is not the target
-UDP port. Upstream proxies receive the original magic CONNECT request and must
-support UoT at the final hop. Tunnels close on malformed input, denied targets,
+Real UDP destinations use the `ports` restriction but no IP/domain ACL.
+The magic address's port (normally 0) is not the target UDP port.
+Upstream proxies receive the original magic CONNECT request and must support
+UoT at the final hop. Tunnels close on malformed input, rejected ports,
 fixed-target I/O errors, client disconnect, or two minutes without traffic.
-In multi-target mode, denied/unresolvable destinations are dropped without
+In multi-target mode, blocked-port/unresolvable destinations are dropped without
 interrupting other traffic. One UDP socket preserves the local source port
-across targets; a bounded 256-entry policy/DNS cache expires entries after one
-minute. Fixed-target v2 mode uses a connected UDP socket. Empty UDP datagrams,
+across targets; a bounded 256-entry DNS/destination cache expires entries after
+one minute. Fixed-target v2 mode uses a connected UDP socket. Empty UDP datagrams,
 65,000-byte payloads and both v2 connect/non-connect framing are tested.
 
 
@@ -83,7 +82,7 @@ Build Caddy with this plugin. You can add it from [Caddy's download page](https:
 $ xcaddy build --with github.com/caddyserver/forwardproxy
 ```
 
-Most people prefer the [Caddyfile](https://caddyserver.com/docs/caddyfile) for configuration. You can stand up a simple, wide-open unauthenticated forward proxy like this:
+Most people prefer the [Caddyfile](https://caddyserver.com/docs/caddyfile) for configuration. The following unauthenticated example is **only for isolated tests**, never a public VPS:
 
 ```
 :443, example.com {
@@ -109,7 +108,7 @@ The `forward_proxy` has a default [directive order](https://caddyserver.com/docs
 
 This plugin enables [Caddy](https://caddyserver.com) to act as a forward proxy, with support for HTTP/3, HTTP/2, and HTTP/1.1 requests. HTTP/3 and HTTP/2 will usually improve performance due to multiplexing.
 
-Forward proxy plugin includes common features like Access Control Lists and authentication, as well as some unique features to assist with security and privacy. Default configuration of forward proxy is compliant with existing HTTP standards, but some features force plugin to exhibit non-standard but non-breaking behavior to preserve privacy.
+Forward proxy plugin includes authentication, as well as some unique features to assist with security and privacy. Default configuration of forward proxy is compliant with existing HTTP standards, but some features force plugin to exhibit non-standard but non-breaking behavior to preserve privacy.
 
 Probing resistance—one of the signature features of this plugin—attempts to hide the fact that your webserver is also a forward proxy, helping the proxy to stay under the radar. Eventually, forwardproxy plugin implemented a simple *reverse* proxy (`upstream https://user:password@next-hop.com` in Caddyfile) just so users may take advantage of `probe_resistance` when they need a reverse proxy (for example, to build a chain of proxies). Reverse proxy implementation will stay simple, and if you need a powerful reverse proxy, look into Caddy's standard `proxy` directive.
 
@@ -142,15 +141,6 @@ forward_proxy {
 
 	upstream https://user:password@extra-upstream-hop.com
 
-	acl {
-		allow     *.caddyserver.com
-		deny      192.168.1.1/32 192.168.0.0/16 *.prohibitedsite.com *.localhost
-		allow     ::1/128 8.8.8.8 github.com *.github.io
-		allow_file /path/to/whitelist.txt
-		deny_file  /path/to/blacklist.txt
-		allow     all
-		deny      all # unreachable rule, remaining requests are matched by `allow all` above
-	}
 }
 ```
 
@@ -203,51 +193,14 @@ forward_proxy {
   Specifies ports forwardproxy will whitelist for all requests. Other ports will be forbidden.
 
   Default: no restrictions.
--     acl {  
-    	acl_directive  
-    	...  
-    	acl_directive  
-      }
-  Specifies **order** and rules for allowed destination IP networks, IP addresses and hostnames.
-  The hostname in each forwardproxy request will be resolved to an IP address,
-  and caddy will check the IP address and hostname against the directives in order until a directive matches the request.
-  
-  `acl_directive` may be:  
-    - `allow [ip or subnet or hostname] [ip or subnet or hostname]...`
-    - `allow_file /path/to/whitelist.txt`
-    - `deny [ip or subnet or hostname] [ip or subnet or hostname]...`
-    - `deny_file /path/to/blacklist.txt`
-  
-  If you don't want unmatched requests to be subject to the default policy, you could finish
-  your acl rules with one of the following to specify action on unmatched requests:
-    - `allow all`
-    - `deny all`
-
-  For `hostname`, you can specify `*.` as a prefix to match domain and subdomains. For example,
-  `*.caddyserver.com` will match `caddyserver.com`, `subdomain.caddyserver.com`, but not `fakecaddyserver.com`.
-  Note that hostname rules, matched early in the chain, will override later IP rules,
-  so it is advised to put IP rules first, unless domains are highly trusted and should override the
-  IP rules. Also note that domain-based blacklists are easily circumventable by directly specifying the IP.
-  
-  For `allow_file`/`deny_file` directives, syntax is the same, and each entry must be separated by newline.
-  
-  This policy applies to all requests except requests to the proxy's own domain and port.
-  Whitelisting/blacklisting of ports on per-host/IP basis is not supported.
-
-  Default policy:
-
-  ```
-  acl {
-    deny 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12
-    deny 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.18.0.0/15
-    deny 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4
-    deny ::/128 ::1/128 64:ff9b::/96 100::/64 2001::/32 2001:db8::/32
-    deny 2002::/16 fc00::/7 fe80::/10 ff00::/8
-    allow all
-  }
-  ```
-  
-  Default deny rules prohibit common local, special-use, translated and non-routable address ranges. Explicit user ACL rules still take precedence; this is a secure default, not an immutable blocklist.
+**Security note for private VPS deployments:** Destination IP/domain ACLs have
+been removed in this fork. TCP destinations are resolved and connected using
+Go's native dialer, including IPv4/IPv6 Happy Eyeballs. Domains resolving to
+loopback, private, link-local or cloud metadata IPs are **not blocked**.
+Only run this configuration with `basic_auth` and restrict access at the VPS
+firewall/security group; an unauthenticated public proxy is unsafe.
+Old `acl { ... }` blocks must be removed from Caddyfile/JSON configuration.
+The `ports` restriction remains available.
 
 ### Timeouts
 
@@ -277,7 +230,7 @@ By default, forwardproxy will reuse connections by using Go's built-in connectio
 - `upstream [https://username:password@upstreamproxy.site:443]`  
   Sets upstream proxy to route all forwardproxy requests through it.
   This setting does not affect non-forwardproxy requests nor requests with wrong credentials.
-  Upstream is incompatible with `acl` and `ports` subdirectives.
+  For upstream connections, the upstream proxy owns destination policy, including port restrictions.
 
   Supported schemes to remote host: https.
 
