@@ -159,9 +159,17 @@ func (h Handler) serveUOT(ctx context.Context, stream net.Conn, version int) {
 		now := time.Now()
 		if !cached || now.After(entry.expires) {
 			entry = uotCachedDestination{expires: now.Add(uotCacheTTL)}
-			IPs, err := h.lookupAllowedIPs(ctx, destination.AddrString(), strconv.Itoa(int(destination.Port)))
-			if err == nil {
-				entry.address = &net.UDPAddr{IP: IPs[0], Port: int(destination.Port)}
+			port := strconv.Itoa(int(destination.Port))
+			host := destination.AddrString()
+			// Check ACL before DNS, but only against the original destination.
+			// UDP WriteTo requires one concrete IP; unlike TCP it cannot race.
+			if h.portIsAllowed(port) && h.destinationIsAllowed(host) {
+				addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+				if err == nil && len(addrs) > 0 {
+					entry.address = &net.UDPAddr{
+						IP: addrs[0].IP, Zone: addrs[0].Zone, Port: int(destination.Port),
+					}
+				}
 			}
 			// Keep the cache bounded, recycling expired destinations when full.
 			// A full cache of live entries does not prevent forwarding uncached packets.

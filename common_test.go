@@ -275,6 +275,7 @@ func TestMain(m *testing.M) {
 		tls:  true,
 		proxyHandler: &Handler{
 			ACL: []ACLRule{
+				{Subjects: []string{blacklistedDomain}, Allow: false},
 				{Subjects: []string{blacklistedIPv4 + "/30"}, Allow: false},
 				{Subjects: []string{blacklistedIPv6}, Allow: false},
 				{Subjects: []string{"all"}, Allow: true},

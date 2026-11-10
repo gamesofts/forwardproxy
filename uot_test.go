@@ -416,6 +416,29 @@ func TestUOTAccessControl(t *testing.T) {
 	}
 }
 
+func TestUOTOriginalDestinationACL(t *testing.T) {
+	h := uotTestHandler()
+	private, err := newACLRule("127.0.0.0/8", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.aclRules = append([]aclRule{private}, h.aclRules...)
+	if h.destinationIsAllowed("127.0.0.1") {
+		t.Fatal("literal loopback IP bypassed ACL")
+	}
+	if !h.destinationIsAllowed("localhost") {
+		t.Fatal("IP ACL incorrectly filtered the hostname")
+	}
+	domain, err := newACLRule("localhost", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.aclRules = append([]aclRule{domain}, h.aclRules...)
+	if h.destinationIsAllowed("localhost") {
+		t.Fatal("explicit domain ACL ignored")
+	}
+}
+
 func TestUOTCancellationAndMalformedRequest(t *testing.T) {
 	for _, malformed := range []bool{false, true} {
 		t.Run(strconv.FormatBool(malformed), func(t *testing.T) {

@@ -53,40 +53,31 @@ func TestWhitelistBlocking(t *testing.T) {
 	}
 }
 
-func TestLocalhostDefaultForbidden(t *testing.T) {
+// A domain that resolves to loopback is allowed unless a domain ACL denies it.
+func TestLocalhostDomainWithoutResolvedIPFiltering(t *testing.T) {
 	const useTLS = true
 	for _, httpProxyVer := range testHTTPProxyVersions {
 		for _, resource := range testResources {
-			response, err := getViaProxy("localhost:6451", resource, caddyForwardProxyNoBlacklistOverride.addr, httpProxyVer,
-				"", useTLS)
+			response, err := getViaProxy(caddyHTTPTestTarget.addr, resource, caddyForwardProxyNoBlacklistOverride.addr, httpProxyVer, "", useTLS)
 			if err != nil {
 				t.Fatal(err)
-			} else if response.StatusCode != http.StatusForbidden {
-				t.Fatal("Expected response \"403 Forbidden\", got:", response.StatusCode)
+			} else if err = responseExpected(response, caddyHTTPTestTarget.contents[resource]); err != nil {
+				t.Fatal(err)
 			}
 		}
 	}
+}
 
-	for _, httpProxyVer := range testHTTPProxyVersions {
-		for _, resource := range testResources {
-			response, err := getViaProxy("127.0.0.1:808", resource, caddyForwardProxyNoBlacklistOverride.addr, httpProxyVer,
-				"", useTLS)
+// Literal IP requests still obey the default CIDR denial rules.
+func TestLoopbackLiteralIPDefaultForbidden(t *testing.T) {
+	const useTLS = true
+	for _, address := range []string{"127.0.0.1:808", "[::1]:8080"} {
+		for _, httpProxyVer := range testHTTPProxyVersions {
+			response, err := getViaProxy(address, "/", caddyForwardProxyNoBlacklistOverride.addr, httpProxyVer, "", useTLS)
 			if err != nil {
 				t.Fatal(err)
 			} else if response.StatusCode != http.StatusForbidden {
-				t.Fatal("Expected response \"403 Forbidden\", got:", response.StatusCode)
-			}
-		}
-	}
-
-	for _, httpProxyVer := range testHTTPProxyVersions {
-		for _, resource := range testResources {
-			response, err := getViaProxy("[::1]:8080", resource, caddyForwardProxyNoBlacklistOverride.addr, httpProxyVer,
-				"", useTLS)
-			if err != nil {
-				t.Fatal(err)
-			} else if response.StatusCode != http.StatusForbidden {
-				t.Fatal("Expected response \"403 Forbidden\", got:", response.StatusCode)
+				t.Fatalf("%s: expected 403, got %d", address, response.StatusCode)
 			}
 		}
 	}
