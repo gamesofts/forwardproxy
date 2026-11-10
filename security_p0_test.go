@@ -102,6 +102,48 @@ func TestDefaultSpecialUseIPBlockedViaProxy(t *testing.T) {
 	}
 }
 
+// NativeDial must retain native hostname dialing, including loopback, while
+// keeping the original ACL-denied behavior in the default mode.
+func TestNativeDialWithAuthenticationAndPortPolicy(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(listener.Addr().String())
+
+	h := uotTestHandler()
+	h.NativeDial = true
+	for _, name := range []string{"127.0.0.1", "localhost"} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			conn, err := h.dialContextCheckACL(ctx, "tcp", net.JoinHostPort(name, port))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.Close()
+		})
+	}
+	h.AllowedPorts = []int{443}
+	h.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		t.Fatal("port-restricted request reached dialer")
+		return nil, nil
+	}
+	if _, err := h.dialContextCheckACL(context.Background(), "tcp", "example.invalid:80"); err == nil {
+		t.Fatal("blocked port was accepted")
+	}
+}
+
 func TestHTTP1ConnectNaivePadding(t *testing.T) {
 	echo, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

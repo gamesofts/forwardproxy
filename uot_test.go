@@ -416,6 +416,34 @@ func TestUOTAccessControl(t *testing.T) {
 	}
 }
 
+// Native dialing bypasses destination ACLs only when explicitly requested.
+// Verify packet-mode UDP still preserves source sockets and port restrictions.
+func TestUOTNativeDialOptIn(t *testing.T) {
+	target := M.SocksaddrFromNet(uotEchoServer(t, "127.0.0.1:0"))
+	h := uotTestHandler()
+	h.NativeDial = true
+	h.aclRules = nil // default ACL policy must not be consulted in this mode
+	h.AllowedPorts = []int{int(target.Port)}
+	conn := h.dialUOT(context.Background(), uot.Version)
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	packets, err := (&uot.Client{Version: 2}).DialConn(conn, false, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := packets.WriteTo([]byte("native"), target); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	n, _, err := packets.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "native" {
+		t.Fatalf("unexpected UDP response: %q", buf[:n])
+	}
+}
+
 func TestUOTCancellationAndMalformedRequest(t *testing.T) {
 	for _, malformed := range []bool{false, true} {
 		t.Run(strconv.FormatBool(malformed), func(t *testing.T) {

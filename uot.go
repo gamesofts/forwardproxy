@@ -159,9 +159,23 @@ func (h Handler) serveUOT(ctx context.Context, stream net.Conn, version int) {
 		now := time.Now()
 		if !cached || now.After(entry.expires) {
 			entry = uotCachedDestination{expires: now.Add(uotCacheTTL)}
-			IPs, err := h.lookupAllowedIPs(ctx, destination.AddrString(), strconv.Itoa(int(destination.Port)))
-			if err == nil {
-				entry.address = &net.UDPAddr{IP: IPs[0], Port: int(destination.Port)}
+			port := strconv.Itoa(int(destination.Port))
+			if h.NativeDial {
+				// Packet-mode UoT has no Happy Eyeballs handshake; keep a
+				// single source-port-preserving socket and use Go's resolver.
+				if h.portIsAllowed(port) {
+					addrs, err := net.DefaultResolver.LookupIPAddr(ctx, destination.AddrString())
+					if err == nil && len(addrs) > 0 {
+						entry.address = &net.UDPAddr{
+							IP: addrs[0].IP, Zone: addrs[0].Zone, Port: int(destination.Port),
+						}
+					}
+				}
+			} else {
+				IPs, err := h.lookupAllowedIPs(ctx, destination.AddrString(), port)
+				if err == nil {
+					entry.address = &net.UDPAddr{IP: IPs[0], Port: int(destination.Port)}
+				}
 			}
 			// Keep the cache bounded, recycling expired destinations when full.
 			// A full cache of live entries does not prevent forwarding uncached packets.

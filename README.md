@@ -20,7 +20,8 @@ We are also seeking experienced maintainers who have experience with these kinds
 
 - HTTP/1.1, HTTP/2, and HTTP/3 support
 - Authentication
-- Access control lists
+- Access control lists (default; unchanged from upstream)
+- Optional Go-native DNS/dialing for authenticated private VPS deployments
 - Optional probe resistance
 - PAC file
 - Naive-compatible SagerNet UDP over TCP (UoT v1 and v2)
@@ -248,6 +249,36 @@ forward_proxy {
   ```
   
   Default deny rules prohibit common local, special-use, translated and non-routable address ranges. Explicit user ACL rules still take precedence; this is a secure default, not an immutable blocklist.
+
+### Native dialing (opt-in)
+
+- `native_dial` (no arguments) is an optional mode for a personally controlled,
+  **authenticated** remote VPS. TCP connections use Go's native DNS resolution,
+  address selection and IPv4/IPv6 Happy Eyeballs instead of resolving and
+  serially dialing the filtered address list.
+- **The standard `acl` directive and default ACL protection remain unchanged**
+  unless `native_dial` is explicitly enabled. The two options cannot be
+  combined. `native_dial` requires `basic_auth`, or Caddy refuses to start.
+- In `native_dial` mode, hostnames and literal addresses are not checked
+  against destination IP/domain ACLs. DNS names resolving to loopback,
+  private/VPC, link-local or cloud instance metadata services may be reachable.
+  Configure the VPS firewall/security group to restrict that traffic.
+- The `ports` restriction still applies. For UoT, fixed UDP targets use native
+  dialing; multi-target UDP keeps its one-socket architecture and resolves
+  using Go's resolver, selecting one returned IP rather than TCP-style racing.
+- Chained `upstream` connections continue to delegate destination policy to
+  the final upstream proxy.
+
+For a private VPS, add `native_dial` under the authenticated `forward_proxy` block:
+
+```caddyfile
+forward_proxy {
+    basic_auth user strong-password
+    native_dial
+}
+```
+
+Omit `native_dial` to retain all original ACL checks and default blocked ranges.
 
 ### Timeouts
 

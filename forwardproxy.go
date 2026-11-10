@@ -91,8 +91,12 @@ type Handler struct {
 	// Optionally configure an upstream proxy to use.
 	Upstream string `json:"upstream,omitempty"`
 
-	// Access control list.
+	// Access control list (original Caddy forwardproxy behavior by default).
 	ACL []ACLRule `json:"acl,omitempty"`
+
+	// Opt-in native DNS/dialing for a trusted, authenticated private VPS.
+	// Bypasses destination ACLs, including the default private-IP restrictions.
+	NativeDial bool `json:"native_dial,omitempty"`
 
 	// Ports to be allowed to connect to (if non-empty).
 	AllowedPorts []int `json:"allowed_ports,omitempty"`
@@ -120,6 +124,17 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // Provision ensures that h is set up properly before use.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
+
+	// NativeDial deliberately removes the default IP safety barrier.
+	// Require proxy authentication and refuse conflicting explicit ACL rules.
+	if h.NativeDial {
+		if len(h.AuthCredentials) == 0 {
+			return fmt.Errorf("native_dial requires basic_auth")
+		}
+		if len(h.ACL) > 0 {
+			return fmt.Errorf("native_dial cannot be combined with acl")
+		}
+	}
 
 	if h.DialTimeout <= 0 {
 		h.DialTimeout = caddy.Duration(30 * time.Second)
@@ -174,7 +189,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	dialer := &net.Dialer{
 		Timeout:   time.Duration(h.DialTimeout),
 		KeepAlive: 30 * time.Second,
-		DualStack: true,
 	}
 	h.dialContext = dialer.DialContext
 	h.httpTransport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
@@ -518,9 +532,23 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	}
 
 	// UoT's magic destination is a protocol marker, not a DNS name or real
-	// destination port. Check ACLs on each encapsulated UDP destination instead.
+	// destination port. Enforce target policy on encapsulated UDP traffic.
 	if version, ok := uotVersion(host); ok && network == "tcp" {
 		return h.dialUOT(ctx, version), nil
+	}
+
+	if h.NativeDial {
+		// Keep the port policy but let Go resolve the original hostname and
+		// select/fallback IPv4 and IPv6 endpoints natively (Happy Eyeballs).
+		if !h.portIsAllowed(port) {
+			return nil, caddyhttp.Error(http.StatusForbidden,
+				fmt.Errorf("port %s is not allowed", port))
+		}
+		conn, err = h.dialContext(ctx, network, hostPort)
+		if err != nil {
+			return conn, caddyhttp.Error(http.StatusBadGateway, err)
+		}
+		return conn, nil
 	}
 
 	IPs, err := h.lookupAllowedIPs(ctx, host, port)

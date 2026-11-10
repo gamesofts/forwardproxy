@@ -85,6 +85,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				h.AllowedPorts[i] = intPort
 			}
 
+		case "native_dial":
+			if len(d.RemainingArgs()) != 0 {
+				return d.ArgErr()
+			}
+			h.NativeDial = true
+
 		case "hide_ip":
 			args := d.RemainingArgs()
 			if len(args) != 0 {
