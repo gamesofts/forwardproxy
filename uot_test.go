@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -157,7 +158,17 @@ func TestUOTDestinationAddresses(t *testing.T) {
 			addr := uotEchoServer(t, net.JoinHostPort(listenHost, "0"))
 			_, port, _ := net.SplitHostPort(addr.String())
 			destination := M.ParseSocksaddr(net.JoinHostPort(host, port))
-			conn := uotTestHandler().dialUOT(context.Background(), uot.Version)
+			handler := uotTestHandler()
+			nativeDial := handler.dialContext
+			var dialed atomic.Bool
+			handler.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				if network != "udp" || address != destination.String() {
+					t.Errorf("UoT did not dial the original target: %s %s", network, address)
+				}
+				dialed.Store(true)
+				return nativeDial(ctx, network, address)
+			}
+			conn := handler.dialUOT(context.Background(), uot.Version)
 			defer conn.Close()
 			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 			packets, err := (&uot.Client{Version: 2}).DialConn(conn, false, destination)
@@ -174,6 +185,9 @@ func TestUOTDestinationAddresses(t *testing.T) {
 			}
 			if string(buffer[:n]) != "address test" {
 				t.Fatal("UDP payload changed")
+			}
+			if !dialed.Load() {
+				t.Fatal("native UDP dialer was not invoked")
 			}
 		})
 	}
@@ -197,7 +211,7 @@ func TestUOTUpstream(t *testing.T) {
 	}
 }
 
-func TestUOTMultiTargetPolicyAndSourcePort(t *testing.T) {
+func TestUOTMultiTargetPolicyAndPerDestinationPort(t *testing.T) {
 	first := M.SocksaddrFromNet(uotEchoServer(t, "127.0.0.1:0"))
 	second := M.SocksaddrFromNet(uotEchoServer(t, "127.0.0.1:0"))
 	h := uotTestHandler()
@@ -242,8 +256,8 @@ func TestUOTMultiTargetPolicyAndSourcePort(t *testing.T) {
 		}
 	}
 
-	// Observe the proxy's actual source port at two independent UDP targets.
-	var sourcePort string
+	// Native per-destination UDP sockets keep their own source port stable
+	// on reuse, but no longer share one source port across destinations.
 	unrestricted := uotTestHandler().dialUOT(context.Background(), uot.Version)
 	defer unrestricted.Close()
 	_ = unrestricted.SetDeadline(time.Now().Add(2 * time.Second))
@@ -251,12 +265,18 @@ func TestUOTMultiTargetPolicyAndSourcePort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
-		peer, err := net.ListenPacket("udp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer peer.Close()
+	peerOne, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peerOne.Close()
+	peerTwo, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peerTwo.Close()
+	var firstSourcePort string
+	for _, peer := range []net.PacketConn{peerOne, peerTwo, peerOne} {
 		_ = peer.SetReadDeadline(time.Now().Add(time.Second))
 		if _, err := multi.WriteTo([]byte("source port"), peer.LocalAddr()); err != nil {
 			t.Fatal(err)
@@ -266,10 +286,12 @@ func TestUOTMultiTargetPolicyAndSourcePort(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, port, _ := net.SplitHostPort(from.String())
-		if i == 0 {
-			sourcePort = port
-		} else if sourcePort != port {
-			t.Fatalf("source port changed: %s -> %s", sourcePort, port)
+		if peer == peerOne {
+			if firstSourcePort == "" {
+				firstSourcePort = port
+			} else if firstSourcePort != port {
+				t.Fatalf("source port changed when reusing a destination: %s -> %s", firstSourcePort, port)
+			}
 		}
 	}
 }
@@ -311,40 +333,53 @@ func TestUOTActiveCancellationAndUploadEOF(t *testing.T) {
 func TestUOTDestinationCacheRecyclesExpiredEntries(t *testing.T) {
 	now := time.Now()
 	cache := make(map[M.Socksaddr]uotCachedDestination)
-	for port := 1; port <= uotCacheSize; port++ {
+	oldest := M.ParseSocksaddrHostPort("127.0.0.1", 1)
+	oldConn, otherEnd := net.Pipe()
+	defer oldConn.Close()
+	defer otherEnd.Close()
+	cache[oldest] = uotCachedDestination{conn: oldConn, expires: now.Add(-time.Second)}
+	for port := 2; port <= uotCacheSize; port++ {
 		key := M.ParseSocksaddrHostPort("127.0.0.1", uint16(port))
 		cache[key] = uotCachedDestination{expires: now.Add(time.Minute)}
 	}
+
 	newDestination := M.ParseSocksaddrHostPort("127.0.0.1", uint16(uotCacheSize+1))
-	newEntry := uotCachedDestination{expires: now.Add(2*time.Minute)}
-
-	// Do not evict an unexpired destination to make room.
-	storeUOTDestination(cache, newDestination, newEntry, now)
+	newEntry := uotCachedDestination{expires: now.Add(2 * time.Minute)}
+	evicted := storeUOTDestination(cache, newDestination, newEntry)
+	if evicted != oldConn {
+		t.Fatal("expired oldest socket was not returned for closing")
+	}
+	_ = evicted.Close()
 	if len(cache) != uotCacheSize {
-		t.Fatalf("cache grew beyond limit: %d", len(cache))
+		t.Fatalf("cache exceeded connection cap: %d", len(cache))
 	}
-	if _, exists := cache[newDestination]; exists {
-		t.Fatal("unexpected eviction of a live entry")
+	if _, exists := cache[oldest]; exists {
+		t.Fatal("expired connection was not evicted")
 	}
-
-	// Once the original entries expire, a new destination can be cached.
-	afterExpiry := now.Add(time.Minute)
-	storeUOTDestination(cache, newDestination, newEntry, afterExpiry)
-	if len(cache) != uotCacheSize {
-		t.Fatalf("cache grew beyond limit after recycling: %d", len(cache))
-	}
-	if got, exists := cache[newDestination]; !exists || !got.expires.Equal(newEntry.expires) {
-		t.Fatal("new destination was not cached after old entries expired")
+	if _, exists := cache[newDestination]; !exists {
+		t.Fatal("new destination was not cached")
 	}
 
-	// Replacing an existing entry must work even when the cache is full.
-	replacement := uotCachedDestination{expires: now.Add(3*time.Minute)}
-	storeUOTDestination(cache, newDestination, replacement, afterExpiry)
-	if got := cache[newDestination]; !got.expires.Equal(replacement.expires) {
-		t.Fatal("existing destination was not refreshed")
+	// Replacement works at capacity and closes the previous connection.
+	replacementConn, replacementPeer := net.Pipe()
+	defer replacementConn.Close()
+	defer replacementPeer.Close()
+	newEntry.conn = replacementConn
+	if old := storeUOTDestination(cache, newDestination, newEntry); old != nil {
+		t.Fatal("unexpected old socket on replacement")
 	}
+	if len(cache) != uotCacheSize || cache[newDestination].conn != replacementConn {
+		t.Fatal("replacement entry missing or grew cache")
+	}
+
+	// When all entries are live, the oldest is evicted to cap FDs and readers.
+	extra := M.ParseSocksaddrHostPort("127.0.0.1", uint16(uotCacheSize+2))
+	storeUOTDestination(cache, extra, uotCachedDestination{expires: now.Add(3 * time.Minute)})
 	if len(cache) != uotCacheSize {
-		t.Fatalf("cache grew beyond limit after refresh: %d", len(cache))
+		t.Fatalf("live-entry eviction grew cache: %d", len(cache))
+	}
+	if _, exists := cache[extra]; !exists {
+		t.Fatal("new destination was dropped when cache was full")
 	}
 }
 
@@ -413,6 +448,29 @@ func TestUOTAccessControl(t *testing.T) {
 				t.Fatal("ACL was bypassed")
 			}
 		})
+	}
+}
+
+func TestUOTOriginalDestinationACL(t *testing.T) {
+	h := uotTestHandler()
+	private, err := newACLRule("127.0.0.0/8", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.aclRules = append([]aclRule{private}, h.aclRules...)
+	if h.destinationIsAllowed("127.0.0.1") {
+		t.Fatal("literal loopback IP bypassed ACL")
+	}
+	if !h.destinationIsAllowed("localhost") {
+		t.Fatal("IP ACL incorrectly filtered the hostname")
+	}
+	domain, err := newACLRule("localhost", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.aclRules = append([]aclRule{domain}, h.aclRules...)
+	if h.destinationIsAllowed("localhost") {
+		t.Fatal("explicit domain ACL ignored")
 	}
 }
 

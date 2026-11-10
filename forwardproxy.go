@@ -28,6 +28,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"net/netip"
 	"net/http"
 	"net/url"
 	"os"
@@ -91,7 +92,7 @@ type Handler struct {
 	// Optionally configure an upstream proxy to use.
 	Upstream string `json:"upstream,omitempty"`
 
-	// Access control list.
+	// ACL for requested domains and literal IPs, without DNS pre-resolution.
 	ACL []ACLRule `json:"acl,omitempty"`
 
 	// Ports to be allowed to connect to (if non-empty).
@@ -174,7 +175,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	dialer := &net.Dialer{
 		Timeout:   time.Duration(h.DialTimeout),
 		KeepAlive: 30 * time.Second,
-		DualStack: true,
 	}
 	h.dialContext = dialer.DialContext
 	h.httpTransport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
@@ -518,64 +518,47 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	}
 
 	// UoT's magic destination is a protocol marker, not a DNS name or real
-	// destination port. Check ACLs on each encapsulated UDP destination instead.
+	// destination port. Enforce target policy on encapsulated UDP traffic.
 	if version, ok := uotVersion(host); ok && network == "tcp" {
 		return h.dialUOT(ctx, version), nil
 	}
 
-	IPs, err := h.lookupAllowedIPs(ctx, host, port)
-	if err != nil {
-		return nil, err
-	}
-	// As with net.Dial, try each permitted IP until a connection succeeds.
-	for _, ip := range IPs {
-		conn, err = h.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
-		if err == nil {
-			return conn, nil
-		}
-	}
-	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
-}
-
-// lookupAllowedIPs applies the same domain, IP and port policy to TCP and UoT.
-// Callers must use the returned IPs directly, without resolving the name again.
-func (h Handler) lookupAllowedIPs(ctx context.Context, host, port string) ([]net.IP, error) {
+	// Apply ACL only to the requested destination; DNS is handled once
+	// by Go's native dialer, retaining its IPv4/IPv6 Happy Eyeballs logic.
 	if !h.portIsAllowed(port) {
-		// return nil, &proxyError{S: "port " + port + " is not allowed", Code: http.StatusForbidden}
 		return nil, caddyhttp.Error(http.StatusForbidden,
 			fmt.Errorf("port %s is not allowed", port))
 	}
+	if !h.destinationIsAllowed(host) {
+		return nil, caddyhttp.Error(http.StatusForbidden,
+			fmt.Errorf("disallowed host %s", host))
+	}
+	conn, err = h.dialContext(ctx, network, hostPort)
+	if err != nil {
+		return conn, caddyhttp.Error(http.StatusBadGateway, err)
+	}
+	return conn, nil
+}
 
-match:
+// destinationIsAllowed does not query DNS. IP/CIDR rules only inspect literal
+// IPs, while hostname rules only inspect original domain names.
+func (h Handler) destinationIsAllowed(host string) bool {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		// ParseAddr also recognizes scoped IPv6 literals (fe80::1%eth0).
+		return h.hostIsAllowed(host, net.IP(ip.AsSlice()))
+	}
 	for _, rule := range h.aclRules {
-		if _, ok := rule.(*aclDomainRule); ok {
+		switch rule.(type) {
+		case *aclDomainRule, *aclAllRule:
 			switch rule.tryMatch(nil, host) {
-			case aclDecisionDeny:
-				return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("disallowed host %s", host))
 			case aclDecisionAllow:
-				break match
+				return true
+			case aclDecisionDeny:
+				return false
 			}
 		}
 	}
-
-	IPs, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
-	if err != nil {
-		// return nil, &proxyError{S: fmt.Sprintf("Lookup of %s failed: %v", host, err),
-		// Code: http.StatusBadGateway}
-		return nil, caddyhttp.Error(http.StatusBadGateway,
-			fmt.Errorf("lookup of %s failed: %v", host, err))
-	}
-
-	var allowed []net.IP
-	for _, ip := range IPs {
-		if h.hostIsAllowed(host, ip) {
-			allowed = append(allowed, ip)
-		}
-	}
-	if len(allowed) > 0 {
-		return allowed, nil
-	}
-	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
+	return false
 }
 
 func (h Handler) hostIsAllowed(hostname string, ip net.IP) bool {
@@ -587,8 +570,6 @@ func (h Handler) hostIsAllowed(hostname string, ip net.IP) bool {
 			return true
 		}
 	}
-	// TODO: convert this to log entry
-	// fmt.Println("ERROR: no acl match for ", hostname, ip) // shouldn't happen
 	return false
 }
 

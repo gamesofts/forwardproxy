@@ -102,6 +102,61 @@ func TestDefaultSpecialUseIPBlockedViaProxy(t *testing.T) {
 	}
 }
 
+// The ACL inspects a request's host, not the IP that DNS might resolve.
+func TestACLChecksOriginalDestinationWithoutDNS(t *testing.T) {
+	h := uotTestHandler()
+	private, err := newACLRule("127.0.0.0/8", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.aclRules = append([]aclRule{private}, h.aclRules...)
+
+	called := false
+	h.dialContext = func(_ context.Context, network, address string) (net.Conn, error) {
+		called = true
+		if network != "tcp" || address != "localhost:443" {
+			t.Fatalf("native dial target changed: %s %s", network, address)
+		}
+		return nil, fmt.Errorf("test dial failure")
+	}
+	// "localhost" reaches DialContext unchanged, even if DNS later returns 127/8.
+	if _, err := h.dialContextCheckACL(context.Background(), "tcp", "localhost:443"); err == nil || !called {
+		t.Fatal("domain was not passed directly to the dialer")
+	}
+
+	called = false
+	if _, err := h.dialContextCheckACL(context.Background(), "tcp", "127.0.0.1:443"); err == nil || called {
+		t.Fatal("literal private IP must be denied before dialing")
+	}
+
+	domainDeny, err := newACLRule("*.example.com", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.aclRules = append([]aclRule{domainDeny}, h.aclRules...)
+	called = false
+	if _, err := h.dialContextCheckACL(context.Background(), "tcp", "foo.example.com:443"); err == nil || called {
+		t.Fatal("domain ACL denial was bypassed")
+	}
+
+	// A zone identifier must not cause scoped IPv6 literals to be treated
+	// as ordinary domain names (and bypass a link-local CIDR ACL).
+	linkLocal, err := newACLRule("fe80::/10", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.aclRules = append([]aclRule{linkLocal}, h.aclRules...)
+	if h.destinationIsAllowed("fe80::1%eth0") {
+		t.Fatal("scoped IPv6 literal bypassed link-local CIDR ACL")
+	}
+
+	h.AllowedPorts = []int{443}
+	called = false
+	if _, err := h.dialContextCheckACL(context.Background(), "tcp", "example.invalid:80"); err == nil || called {
+		t.Fatal("port restriction was bypassed")
+	}
+}
+
 func TestHTTP1ConnectNaivePadding(t *testing.T) {
 	echo, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

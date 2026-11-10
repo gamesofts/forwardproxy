@@ -20,7 +20,8 @@ We are also seeking experienced maintainers who have experience with these kinds
 
 - HTTP/1.1, HTTP/2, and HTTP/3 support
 - Authentication
-- Access control lists
+- Domain and literal-IP access control lists
+- Go-native DNS/dialing with IPv4/IPv6 Happy Eyeballs
 - Optional probe resistance
 - PAC file
 - Naive-compatible SagerNet UDP over TCP (UoT v1 and v2)
@@ -56,16 +57,22 @@ payloads travel inside the existing TCP/TLS connection; the server needs
 outbound UDP connectivity to the requested destinations, with no extra inbound
 UDP listener for UoT. HTTP/3 uses QUIC as its outer transport instead.
 
-Real UDP destination domains, resolved IPs and ports use the existing ACL and
+Real UDP destination names, literal IPs and ports use the request-only ACL and
 `ports` restrictions. The magic address's port (normally 0) is not the target
 UDP port. Upstream proxies receive the original magic CONNECT request and must
 support UoT at the final hop. Tunnels close on malformed input, denied targets,
 fixed-target I/O errors, client disconnect, or two minutes without traffic.
 In multi-target mode, denied/unresolvable destinations are dropped without
-interrupting other traffic. One UDP socket preserves the local source port
-across targets; a bounded 256-entry policy/DNS cache expires entries after one
-minute. Fixed-target v2 mode uses a connected UDP socket. Empty UDP datagrams,
-65,000-byte payloads and both v2 connect/non-connect framing are tested.
+interrupting other traffic. UDP destinations use Go's native
+`DialContext("udp", ...)`: each target has its own connected UDP socket and
+source port, reused while active. A bounded 256-entry connection cache evicts
+idle or least-recently-used destinations, closing their sockets and readers.
+This changes the former single-source-port behavior across UDP targets; STUN,
+P2P and other source-port-sensitive protocols may observe different public
+source ports per destination. Fixed-target v2 mode also uses a connected UDP
+socket. Neither UoT mode performs an explicit pre-dial DNS lookup.
+Empty UDP datagrams, 65,000-byte payloads and both v2 connect/non-connect
+framing are tested.
 
 
 ## Introduction
@@ -208,9 +215,11 @@ forward_proxy {
     	...  
     	acl_directive  
       }
-  Specifies **order** and rules for allowed destination IP networks, IP addresses and hostnames.
-  The hostname in each forwardproxy request will be resolved to an IP address,
-  and caddy will check the IP address and hostname against the directives in order until a directive matches the request.
+  Specifies **order** and rules for the original requested hostnames and
+  literal IP addresses. ACL checks do not perform DNS resolution: domain
+  rules inspect the requested domain; IP/CIDR rules inspect only literal IP
+  requests. Go's native dialer resolves permitted domains and handles
+  IPv4/IPv6 fallback.
   
   `acl_directive` may be:  
     - `allow [ip or subnet or hostname] [ip or subnet or hostname]...`
@@ -225,9 +234,9 @@ forward_proxy {
 
   For `hostname`, you can specify `*.` as a prefix to match domain and subdomains. For example,
   `*.caddyserver.com` will match `caddyserver.com`, `subdomain.caddyserver.com`, but not `fakecaddyserver.com`.
-  Note that hostname rules, matched early in the chain, will override later IP rules,
-  so it is advised to put IP rules first, unless domains are highly trusted and should override the
-  IP rules. Also note that domain-based blacklists are easily circumventable by directly specifying the IP.
+  Domain rules and IP/CIDR rules match their corresponding request types,
+  respecting rule order. IP/CIDR rules cannot block domains that resolve to
+  those ranges; domain blacklists can be bypassed by using a literal IP.
   
   For `allow_file`/`deny_file` directives, syntax is the same, and each entry must be separated by newline.
   
@@ -247,7 +256,11 @@ forward_proxy {
   }
   ```
   
-  Default deny rules prohibit common local, special-use, translated and non-routable address ranges. Explicit user ACL rules still take precedence; this is a secure default, not an immutable blocklist.
+  Default deny rules prohibit literal local, special-use, translated and
+  non-routable IP addresses only. Domain names resolving to those ranges are
+  not blocked: this trades away DNS-based IP filtering for native dialing.
+  Trusted private-VPS users should protect local/VPC/metadata services via
+  host firewall or security groups. Explicit ACL rules still take precedence.
 
 ### Timeouts
 
