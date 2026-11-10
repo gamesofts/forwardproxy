@@ -28,6 +28,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"net/netip"
 	"net/http"
 	"net/url"
 	"os"
@@ -35,6 +36,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -91,7 +93,7 @@ type Handler struct {
 	// Optionally configure an upstream proxy to use.
 	Upstream string `json:"upstream,omitempty"`
 
-	// Access control list.
+	// Ordered destination ACL rules (domains and resolved IPs).
 	ACL []ACLRule `json:"acl,omitempty"`
 
 	// Ports to be allowed to connect to (if non-empty).
@@ -174,9 +176,13 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	dialer := &net.Dialer{
 		Timeout:   time.Duration(h.DialTimeout),
 		KeepAlive: 30 * time.Second,
-		DualStack: true,
 	}
-	h.dialContext = dialer.DialContext
+	// Keep the unrestricted dialer for upstream proxy connections.
+	// Direct CONNECTs evaluate the exact candidate IP immediately before
+	// connect, without interfering with Go's native Happy Eyeballs fallback.
+	aclDialer := *dialer
+	aclDialer.ControlContext = h.controlDestination
+	h.dialContext = aclDialer.DialContext
 	h.httpTransport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
 		return h.dialContextCheckACL(ctx, network, address)
 	}
@@ -491,54 +497,97 @@ func (h Handler) servePacFile(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// dialContextCheckACL enforces Access Control List and calls fp.DialContext
-func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort string) (net.Conn, error) {
-	var conn net.Conn
+// aclHostKey carries the original CONNECT host into Dialer.ControlContext.
+// Go's resolver supplies the *actual* candidate IP to that callback.
+type aclHostKey struct{}
 
+var errACLDenied = errors.New("destination blocked by ACL")
+
+// controlDestination is called after Go resolves an address but before
+// connecting the socket. A denied candidate is skipped by net.Dialer, so
+// other permitted IPv4/IPv6 addresses can still be tried.
+func (h *Handler) controlDestination(ctx context.Context, _, address string, _ syscall.RawConn) error {
+	originalHost, ok := ctx.Value(aclHostKey{}).(string)
+	if !ok || originalHost == "" {
+		return errACLDenied // fail closed if a caller skipped ACL setup
+	}
+	ipHost, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errACLDenied, err)
+	}
+	ip, err := netip.ParseAddr(ipHost)
+	if err != nil {
+		return fmt.Errorf("%w: invalid dial address %s", errACLDenied, ipHost)
+	}
+	if !h.hostIsAllowed(originalHost, net.IP(ip.AsSlice())) {
+		return fmt.Errorf("%w: %s", errACLDenied, ipHost)
+	}
+	return nil
+}
+
+// dialContextCheckACL applies port and hostname ACLs before DNS, then uses
+// net.Dialer + ControlContext to enforce the full ordered domain/IP ACL for
+// each address Go actually attempts. The upstream route remains delegated.
+func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" && network != "tcp6" && network != "udp" {
-		// return nil, &proxyError{S: "Network " + network + " is not supported", Code: http.StatusBadRequest}
 		return nil, caddyhttp.Error(http.StatusBadRequest,
 			fmt.Errorf("network %s is not supported", network))
 	}
-
 	host, port, err := net.SplitHostPort(hostPort)
 	if err != nil {
-		// return nil, &proxyError{S: err.Error(), Code: http.StatusBadRequest}
 		return nil, caddyhttp.Error(http.StatusBadRequest, err)
 	}
-
 	if h.upstream != nil {
-		// if upstreaming -- do not resolve locally nor check acl
-		conn, err = h.dialContext(ctx, network, hostPort)
+		conn, err := h.dialContext(ctx, network, hostPort)
 		if err != nil {
-			// return conn, &proxyError{S: err.Error(), Code: http.StatusBadGateway}
-			return conn, caddyhttp.Error(http.StatusBadGateway, err)
+			return nil, caddyhttp.Error(http.StatusBadGateway, err)
 		}
 		return conn, nil
 	}
-
-	// UoT's magic destination is a protocol marker, not a DNS name or real
-	// destination port. Check ACLs on each encapsulated UDP destination instead.
+	// The UoT marker is a protocol control address, not a real destination.
 	if version, ok := uotVersion(host); ok && network == "tcp" {
 		return h.dialUOT(ctx, version), nil
 	}
-
-	IPs, err := h.lookupAllowedIPs(ctx, host, port)
-	if err != nil {
-		return nil, err
+	if !h.portIsAllowed(port) {
+		return nil, caddyhttp.Error(http.StatusForbidden,
+			fmt.Errorf("port %s is not allowed", port))
 	}
-	// As with net.Dial, try each permitted IP until a connection succeeds.
-	for _, ip := range IPs {
-		conn, err = h.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
-		if err == nil {
-			return conn, nil
+	// Fast-path literal IPs, while still validating them in ControlContext.
+	// For domains, reject explicit hostname denials before any DNS query.
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !h.hostIsAllowed(host, net.IP(ip.AsSlice())) {
+			return nil, caddyhttp.Error(http.StatusForbidden,
+				fmt.Errorf("disallowed address %s", host))
+		}
+	} else {
+	domainRules:
+		for _, rule := range h.aclRules {
+			if _, ok := rule.(*aclDomainRule); ok {
+				switch rule.tryMatch(nil, host) {
+				case aclDecisionDeny:
+					return nil, caddyhttp.Error(http.StatusForbidden,
+						fmt.Errorf("disallowed host %s", host))
+				case aclDecisionAllow:
+					break domainRules
+				}
+			}
 		}
 	}
-	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
+	// Go resolves the domain only once and selects candidate IPs itself.
+	// ControlContext evaluates each actual candidate before connecting.
+	conn, err := h.dialContext(context.WithValue(ctx, aclHostKey{}, host), network, hostPort)
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, errACLDenied) {
+			status = http.StatusForbidden
+		}
+		return nil, caddyhttp.Error(status, err)
+	}
+	return conn, nil
 }
 
-// lookupAllowedIPs applies the same domain, IP and port policy to TCP and UoT.
-// Callers must use the returned IPs directly, without resolving the name again.
+// lookupAllowedIPs is used only by multi-target UoT. It resolves once per
+// cache miss and returns vetted IPs for the shared UDP socket to write to.
 func (h Handler) lookupAllowedIPs(ctx context.Context, host, port string) ([]net.IP, error) {
 	if !h.portIsAllowed(port) {
 		// return nil, &proxyError{S: "port " + port + " is not allowed", Code: http.StatusForbidden}
