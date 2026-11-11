@@ -20,12 +20,17 @@ import (
 )
 
 func uotTestHandler() *Handler {
-	return &Handler{
+	h := &Handler{
 		HideIP:          true,
 		AuthCredentials: [][]byte{EncodeAuthCredentials("test", "pass")},
 		aclRules:        []aclRule{&aclAllRule{allow: true}},
-		dialContext:     (&net.Dialer{Timeout: time.Second}).DialContext,
 	}
+	dialer := &net.Dialer{
+		Timeout:        time.Second,
+		ControlContext: h.controlDestination,
+	}
+	h.dialContext = dialer.DialContext
+	return h
 }
 
 func uotEchoServer(t testing.TB, address string) net.Addr {

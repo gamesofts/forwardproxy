@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 func TestDefaultSpecialUseIPRanges(t *testing.T) {
@@ -99,6 +101,108 @@ func TestDefaultSpecialUseIPBlockedViaProxy(t *testing.T) {
 				t.Fatalf("request to %s returned %d; want 403", address, resp.StatusCode)
 			}
 		})
+	}
+}
+
+// ControlContext checks the real destination IP after native DNS selection,
+// so a domain cannot bypass IP/CIDR restrictions by resolving to a private IP.
+func TestControlContextAppliesOrderedDomainAndIPACL(t *testing.T) {
+	h := uotTestHandler()
+	loopback, err := newACLRule("127.0.0.0/8", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.aclRules = append([]aclRule{loopback}, h.aclRules...)
+	ctx := context.WithValue(context.Background(), aclHostKey{}, "example.org")
+
+	if err := h.controlDestination(ctx, "tcp4", "127.0.0.1:443", nil); !errors.Is(err, errACLDenied) {
+		t.Fatalf("resolved loopback address was not blocked: %v", err)
+	}
+	if err := h.controlDestination(ctx, "udp4", "8.8.8.8:53", nil); err != nil {
+		t.Fatalf("public destination rejected: %v", err)
+	}
+	if err := h.controlDestination(context.Background(), "tcp4", "8.8.8.8:443", nil); !errors.Is(err, errACLDenied) {
+		t.Fatalf("missing ACL context did not fail closed: %v", err)
+	}
+
+	// Explicit domain allow before IP deny overrides the CIDR restriction,
+	// matching the original ordered ACL semantics.
+	allowDomain, err := newACLRule("example.org", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.aclRules = append([]aclRule{allowDomain}, h.aclRules...)
+	if err := h.controlDestination(ctx, "tcp4", "127.0.0.1:443", nil); err != nil {
+		t.Fatalf("ordered domain allow did not take precedence: %v", err)
+	}
+
+	// Domain denial also applies even to a permitted public destination.
+	denyDomain, err := newACLRule("example.org", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.aclRules = append([]aclRule{denyDomain}, h.aclRules...)
+	if err := h.controlDestination(ctx, "tcp4", "8.8.8.8:443", nil); !errors.Is(err, errACLDenied) {
+		t.Fatalf("explicit domain denial was bypassed: %v", err)
+	}
+
+	linkLocal, err := newACLRule("fe80::/10", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.aclRules = []aclRule{linkLocal, &aclAllRule{allow: true}}
+	if err := h.controlDestination(context.WithValue(context.Background(), aclHostKey{}, "example.org"), "tcp6", "[fe80::1%eth0]:443", nil); !errors.Is(err, errACLDenied) {
+		t.Fatalf("scoped IPv6 address bypassed CIDR restriction: %v", err)
+	}
+}
+
+// A rejected DNS candidate must not prevent the standard Dialer from
+// falling back to another family (IPv6 refused, then permitted IPv4).
+func TestNativeDialerACLAndIPv4Fallback(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h := uotTestHandler()
+	denyIPv4, err := newACLRule("127.0.0.0/8", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	denyIPv6, err := newACLRule("::1/128", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.aclRules = []aclRule{denyIPv4, denyIPv6, &aclAllRule{allow: true}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	address := net.JoinHostPort("localhost", port)
+	conn, err := h.dialContextCheckACL(ctx, "tcp", address)
+	if conn != nil {
+		_ = conn.Close()
+		t.Fatal("forbidden loopback connection unexpectedly succeeded")
+	}
+	var handlerErr caddyhttp.HandlerError
+	if !errors.As(err, &handlerErr) || handlerErr.StatusCode != http.StatusForbidden {
+		t.Fatalf("DNS-selected loopback addresses should return 403; got %v", err)
+	}
+
+	h.aclRules = []aclRule{denyIPv6, &aclAllRule{allow: true}}
+	conn, err = h.dialContextCheckACL(ctx, "tcp", address)
+	if err != nil {
+		t.Fatalf("allowed IPv4 fallback failed: %v", err)
+	}
+	_ = conn.Close()
+
+	h.AllowedPorts = []int{443}
+	if conn, err := h.dialContextCheckACL(ctx, "tcp", address); conn != nil || err == nil {
+		if conn != nil { _ = conn.Close() }
+		t.Fatalf("port restriction ignored: %v", err)
 	}
 }
 
