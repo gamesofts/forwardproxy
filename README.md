@@ -56,7 +56,7 @@ payloads travel inside the existing TCP/TLS connection; the server needs
 outbound UDP connectivity to the requested destinations, with no extra inbound
 UDP listener for UoT. HTTP/3 uses QUIC as its outer transport instead.
 
-Real UDP destination domains, resolved IPs and ports use the existing ACL and
+Real UDP destination domains, resolved IPs and ports use the complete ACL and
 `ports` restrictions. The magic address's port (normally 0) is not the target
 UDP port. Upstream proxies receive the original magic CONNECT request and must
 support UoT at the final hop. Tunnels close on malformed input, denied targets,
@@ -248,6 +248,21 @@ forward_proxy {
   ```
   
   Default deny rules prohibit common local, special-use, translated and non-routable address ranges. Explicit user ACL rules still take precedence; this is a secure default, not an immutable blocklist.
+
+For direct TCP connections, Go's native `net.Dialer` resolves the hostname and
+handles IPv4/IPv6 Happy Eyeballs. `ControlContext` checks the **actual candidate
+IP before each connection** against the full ordered domain/IP ACL; disallowed
+candidates are skipped and other addresses can still be attempted. This avoids
+an extra DNS lookup or serial per-IP dialing while retaining the default
+private-address protections, including when a domain resolves to private IPs.
+
+UoT fixed-destination UDP uses the same pre-connect ACL enforcement. In UoT
+multi-target mode, `lookupAllowedIPs()` resolves the target and applies the
+complete ACL before sending through a **single shared UDP socket**. Validated
+destination addresses are cached for one minute (up to 256 entries), preserving
+a common source port across different UDP destinations for STUN/P2P. This UDP
+mode intentionally performs DNS resolution at cache misses; it does not use
+TCP-style Happy Eyeballs.
 
 ### Timeouts
 
