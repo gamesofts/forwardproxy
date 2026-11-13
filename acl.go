@@ -6,6 +6,37 @@ import (
 	"strings"
 )
 
+// defaultDeniedIPRanges protects the proxy from reaching local, special-use,
+// and non-routable destinations unless explicitly permitted by an ACL rule.
+// User-specified ACL rules retain their existing precedence over these defaults.
+var defaultDeniedIPRanges = []string{
+	"0.0.0.0/8",        // unspecified / current network
+	"10.0.0.0/8",       // private
+	"100.64.0.0/10",    // shared address space (CGNAT)
+	"127.0.0.0/8",      // loopback
+	"169.254.0.0/16",   // link-local; cloud metadata endpoints
+	"172.16.0.0/12",    // private
+	"192.0.0.0/24",     // IETF protocol assignments
+	"192.0.2.0/24",     // documentation
+	"192.88.99.0/24",   // deprecated 6to4 relay
+	"192.168.0.0/16",   // private
+	"198.18.0.0/15",    // benchmarking
+	"198.51.100.0/24", // documentation
+	"203.0.113.0/24",  // documentation
+	"224.0.0.0/4",     // multicast
+	"240.0.0.0/4",     // reserved and broadcast
+	"::/128",          // unspecified
+	"::1/128",         // loopback
+	"64:ff9b::/96",    // well-known NAT64 translation prefix
+	"100::/64",        // discard-only
+	"2001::/32",       // Teredo
+	"2001:db8::/32",   // documentation
+	"2002::/16",       // 6to4
+	"fc00::/7",        // unique local
+	"fe80::/10",       // link-local
+	"ff00::/8",        // multicast
+}
+
 // ACLRule describes an ACL rule.
 type ACLRule struct {
 	Subjects []string `json:"subjects,omitempty"`

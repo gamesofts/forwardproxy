@@ -237,13 +237,17 @@ forward_proxy {
   Default policy:
 
   ```
-  acl {  
-  	deny 10.0.0.0/8 127.0.0.0/8 172.16.0.0/12 192.168.0.0/16 ::1/128 fe80::/10  
-  	allow all  
+  acl {
+    deny 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12
+    deny 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.18.0.0/15
+    deny 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4
+    deny ::/128 ::1/128 64:ff9b::/96 100::/64 2001::/32 2001:db8::/32
+    deny 2002::/16 fc00::/7 fe80::/10 ff00::/8
+    allow all
   }
   ```
   
-  Default deny rules intend to prohibit access to localhost and local networks and may be expanded in future.
+  Default deny rules prohibit common local, special-use, translated and non-routable address ranges. Explicit user ACL rules still take precedence; this is a secure default, not an immutable blocklist.
 
 ### Timeouts
 
