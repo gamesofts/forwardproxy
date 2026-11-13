@@ -1,0 +1,75 @@
+name: Sync Caddy upstream
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-caddy-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Avoid enabling this repository-specific automation in downstream forks.
+    if: github.repository == 'gamesofts/forwardproxy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BASE_BRANCH: ${{ github.event.repository.default_branch }}
+      SYNC_BRANCH: sync/caddy-master
+      UPSTREAM_URL: https://github.com/caddyserver/forwardproxy.git
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - name: Configure merge author
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - name: Merge upstream without rewriting Naive history
+        id: merge
+        run: bash .github/scripts/merge-upstream.sh
+      - uses: actions/setup-go@v6
+        if: steps.merge.outputs.changed == 'true'
+        with:
+          go-version-file: go.mod
+      # GITHUB_TOKEN-created PRs do not trigger other workflows. Validate here
+      # before pushing and link this run from the PR description.
+      - name: Test merged code
+        if: steps.merge.outputs.changed == 'true'
+        run: go test -mod=readonly -race ./...
+      - name: Build Caddy with the Naive plugin
+        if: steps.merge.outputs.changed == 'true'
+        run: bash .github/scripts/build-caddy.sh
+      - name: Push and create or update the review PR
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+        run: |
+          git push origin "HEAD:refs/heads/$SYNC_BRANCH"
+          body_file=$(mktemp)
+          cat > "$body_file" <<EOF
+          Merge \`caddyserver/forwardproxy:master\` through \`$UPSTREAM_SHA\` into \`$BASE_BRANCH\`, preserving Naive padding and upstream commit ancestry.
+
+          Validation: \`go test -mod=readonly -race ./...\`, Caddy build, and forward-proxy module registration passed in [this workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID).
+
+          Please use **Create a merge commit** so future syncs can recognize the imported upstream history.
+          EOF
+          pr_number=$(gh pr list --repo "$GITHUB_REPOSITORY" --base "$BASE_BRANCH" --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [[ -n "$pr_number" ]]; then
+            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" --title 'Sync caddyserver/forwardproxy master' --body-file "$body_file"
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" --base "$BASE_BRANCH" --head "$SYNC_BRANCH" --title 'Sync caddyserver/forwardproxy master' --body-file "$body_file"
+          fi
+          rm -f "$body_file"
+      - name: Explain failed sync
+        if: failure()
+        run: |
+          echo 'Sync stopped. Check the failed step for a merge conflict, test/build error, or GitHub permission error. The default branch has not been changed.' >> "$GITHUB_STEP_SUMMARY"
