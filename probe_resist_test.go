@@ -103,6 +103,20 @@ func TestGETAuthWrongProbeResist(t *testing.T) {
 }
 
 // test that responses on http redirect port are same
+func compareRedirects(proxy, reference *http.Response) error {
+	if proxy.StatusCode != http.StatusPermanentRedirect || reference.StatusCode != http.StatusPermanentRedirect {
+		return fmt.Errorf("redirect fixtures must return 308, got %d and %d", proxy.StatusCode, reference.StatusCode)
+	}
+	// The fixtures redirect to their respective HTTPS listeners.
+	// Normalize only that configured authority before comparing.
+	location := reference.Header.Get("Location")
+	if !strings.HasPrefix(location, "https://"+caddyDummyProbeResist.addr+"/") || !strings.HasPrefix(proxy.Header.Get("Location"), "https://"+caddyForwardProxyProbeResist.addr+"/") {
+		return errors.New("redirect fixture did not set its configured HTTPS destination")
+	}
+	reference.Header.Set("Location", strings.Replace(location, caddyDummyProbeResist.addr, caddyForwardProxyProbeResist.addr, 1))
+	return responsesAreEqual(proxy, reference)
+}
+
 func TestGETAuthWrongProbeResistRedir(t *testing.T) {
 	const useTLS = false
 	httpProxyVer := "HTTP/1.1"
@@ -119,7 +133,7 @@ func TestGETAuthWrongProbeResistRedir(t *testing.T) {
 				t.Fatalf("Expected response: %d, Got: %d\n",
 					responseReference.StatusCode, responseProbeResist.StatusCode)
 			}
-			if err := responsesAreEqual(responseProbeResist, responseReference); err != nil {
+			if err := compareRedirects(responseProbeResist, responseReference); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -138,7 +152,7 @@ func TestGETAuthWrongProbeResistRedir(t *testing.T) {
 				t.Fatalf("Expected response: %d, Got: %d\n",
 					responseReference.StatusCode, responseProbeResist.StatusCode)
 			}
-			if err = responsesAreEqual(responseProbeResist, responseReference); err != nil {
+			if err = compareRedirects(responseProbeResist, responseReference); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -243,6 +257,7 @@ func TestConnectAuthWrongProbeResist(t *testing.T) {
 func TestConnectAuthWrongProbeResistRedir(t *testing.T) {
 	const useTLS = false
 	httpProxyVer := "HTTP/1.1"
+
 	for _, wrongCreds := range credentialsWrong {
 		for _, httpTargetVer := range testHTTPTargetVersions {
 			// request test target
@@ -260,7 +275,7 @@ func TestConnectAuthWrongProbeResistRedir(t *testing.T) {
 					t.Fatalf("Expected response: %d, Got: %d\n",
 						responseReference.StatusCode, responseProbeResist.StatusCode)
 				}
-				if err = responsesAreEqual(responseProbeResist, responseReference); err != nil {
+				if err = compareRedirects(responseProbeResist, responseReference); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -279,7 +294,7 @@ func TestConnectAuthWrongProbeResistRedir(t *testing.T) {
 					t.Fatalf("Expected response: %d, Got: %d\n",
 						responseReference.StatusCode, responseProbeResist.StatusCode)
 				}
-				if err = responsesAreEqual(responseProbeResist, responseReference); err != nil {
+				if err = compareRedirects(responseProbeResist, responseReference); err != nil {
 					t.Fatal(err)
 				}
 			}
