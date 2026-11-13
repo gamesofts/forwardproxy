@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Select a stable Caddy release and detect complete/draft fork releases."""
+
+import json
+import base64
+import os
+import re
+import subprocess
+
+
+def gh_api(path):
+    result = subprocess.run(
+        ["gh", "api", path], capture_output=True, text=True, check=False
+    )
+    if result.returncode:
+        if "HTTP 404" in result.stderr:
+            return None
+        raise RuntimeError(f"GitHub API request failed: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def find_release(repository, tag):
+    published = gh_api(f"repos/{repository}/releases/tags/{tag}")
+    if published is not None:
+        return published
+    # The by-tag endpoint only returns published releases. Drafts are visible
+    # in the release list to a token with push access; search every page.
+    page = 1
+    while True:
+        releases = gh_api(f"repos/{repository}/releases?per_page=100&page={page}")
+        if releases is None:
+            raise RuntimeError("Cannot list repository releases")
+        for release in releases:
+            if release["tag_name"] == tag:
+                return release
+        if len(releases) < 100:
+            return None
+        page += 1
+
+
+def select_release(upstream, existing, revision=""):
+    if upstream is None:
+        raise ValueError("Caddy release does not exist")
+    version = upstream["tag_name"]
+    if not re.fullmatch(r"v2\.[0-9]+\.[0-9]+", version):
+        raise ValueError(f"Not a stable Caddy v2 tag: {version}")
+    if upstream.get("draft") or upstream.get("prerelease"):
+        raise ValueError("Draft and prerelease Caddy versions are not published")
+    if revision and not re.fullmatch(r"[0-9a-f]{12}", revision):
+        raise ValueError("Invalid source revision")
+    # Keep existing Caddy-only tags immutable. Plugin updates get a distinct
+    # source-specific release, even when the upstream Caddy tag is unchanged.
+    tag = f"caddy-{version}" + (f"-naive-{revision}" if revision else "")
+    archive = f"{tag}-linux-amd64.tar.gz"
+    complete = False
+    if existing is not None and not existing.get("draft"):
+        assets = {asset["name"] for asset in existing.get("assets", [])}
+        if not {archive, "SHA256SUMS"}.issubset(assets):
+            raise ValueError("Published fork release is incomplete; repair it manually")
+        complete = True
+    return {
+        "version": version,
+        "tag": tag,
+        "archive": archive,
+        "should_build": str(not complete).lower(),
+        "release_exists": str(existing is not None).lower(),
+    }
+
+
+def main():
+    requested = os.environ.get("REQUESTED_VERSION", "").strip()
+    if requested and not re.fullmatch(r"v2\.[0-9]+\.[0-9]+", requested):
+        raise ValueError("Version must look like v2.11.7, without prerelease suffixes")
+    endpoint = f"tags/{requested}" if requested else "latest"
+    upstream = gh_api(f"repos/caddyserver/caddy/releases/{endpoint}")
+    # Validate before inserting an upstream tag into a REST path.
+    selection = select_release(upstream, None)
+    repository = os.environ["GITHUB_REPOSITORY"]
+    source_sha = os.environ["SOURCE_SHA"]
+    if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+        raise ValueError("Release source must be an immutable commit SHA")
+    event_name = os.environ.get("GITHUB_EVENT_NAME")
+    original = find_release(repository, selection["tag"])
+    existing = original
+    revision = ""
+
+    # The original Caddy release is immutable. When this fork has moved on,
+    # publish a new version identified by its source SHA rather than skipping
+    # a required rebuild or silently overwriting an older executable.
+    # PRs only validate builds and never select a publication revision.
+    force_rebuild = event_name == "workflow_dispatch" and os.environ.get("REBUILD_CURRENT", "").lower() == "true"
+    if (
+        event_name != "pull_request"
+        and original is not None
+        and not original.get("draft")
+        and (original.get("target_commitish") != source_sha or force_rebuild)
+    ):
+        revision = source_sha[:12]
+        new_tag = select_release(upstream, None, revision=revision)["tag"]
+        existing = find_release(repository, new_tag)
+        if existing is not None and existing.get("target_commitish") != source_sha:
+            raise ValueError("Revision tag is already associated with another source commit")
+
+    selection = select_release(upstream, existing, revision=revision)
+
+    # Retry a partial draft using the same source snapshot as its first build.
+    if existing is not None and existing.get("draft") and event_name != "pull_request":
+        source_sha = existing.get("target_commitish", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+        raise ValueError("Release source must be an immutable commit SHA")
+    selection["source_sha"] = source_sha
+    latest = gh_api("repos/caddyserver/caddy/releases/latest") if requested else upstream
+    selection["make_latest"] = str(latest is not None and latest["tag_name"] == selection["version"]).lower()
+    module = gh_api(f"repos/caddyserver/caddy/contents/go.mod?ref={selection['version']}")
+    if module is None:
+        raise ValueError("Caddy go.mod is unavailable")
+    go_mod = base64.b64decode(module["content"]).decode("utf-8")
+    required_go = re.search(r"^go (\d+\.\d+)(?:\.\d+)?$", go_mod, re.MULTILINE)
+    if required_go is None:
+        raise ValueError("Caddy Go version requirement is missing")
+    selection["go_version"] = required_go[1] + ".x"
+    with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+        for key, value in selection.items():
+            output.write(f"{key}={value}\n")
+    with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+        summary.write(
+            f"Caddy {selection['version']}, release {selection['tag']}, "
+            f"source {selection['source_sha'][:12]}: "
+            f"build required = {selection['should_build']}.\n"
+        )
+
+
+if __name__ == "__main__":
+    main()
