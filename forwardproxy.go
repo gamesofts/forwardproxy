@@ -343,7 +343,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 		switch r.ProtoMajor {
 		case 1: // http1: hijack the whole flow
-			return serveHijack(ctx, w, targetConn, r.Header.Get("Padding") != "")
+			return serveHijack(w, targetConn, r.Header.Get("Padding") != "")
 		case 2: // http2: keep reading from "request" and writing into same response
 			fallthrough
 		case 3:
@@ -693,7 +693,7 @@ type readCloser struct {
 
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
 // and hijacked connection.
-func serveHijack(ctx context.Context, w http.ResponseWriter, targetConn net.Conn, padding bool) error {
+func serveHijack(w http.ResponseWriter, targetConn net.Conn, padding bool) error {
 	w.WriteHeader(http.StatusOK)
 	clientConn, brw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
@@ -709,7 +709,9 @@ func serveHijack(ctx context.Context, w http.ResponseWriter, targetConn net.Conn
 			fmt.Errorf("failed to flush to client: %v", err))
 	}
 
-	return dualStream(ctx, targetConn, readCloser{Reader: brw.Reader, Closer: clientConn}, clientConn, padding)
+	// After Hijack, net/http detaches clientConn from r.Context(); rely on
+	// clientConn's own EOF/read errors instead of r.Context() cancellation.
+	return dualStream(context.Background(), targetConn, readCloser{Reader: brw.Reader, Closer: clientConn}, clientConn, padding)
 }
 
 const (
