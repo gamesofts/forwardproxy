@@ -28,11 +28,12 @@ import (
 	"io"
 	"math/rand"
 	"net"
-	"net/netip"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -348,6 +349,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			fallthrough
 		case 3:
 			defer r.Body.Close()
+			defer overrideTunnelIdleTimeouts(r, w, connectIdleTimeout)()
 			return dualStream(ctx, targetConn, r.Body, w, r.Header.Get("Padding") != "")
 		}
 
@@ -701,6 +703,10 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn, padding bool) error
 			fmt.Errorf("hijack failed: %v", err))
 	}
 	defer clientConn.Close()
+	// Clear any read/write deadlines left on the raw connection by the HTTP
+	// server (e.g., Caddy v2.11+'s IdleTimeoutWriter sets a write deadline
+	// during the pre-hijack Flush and does not clear it on HTTP/1.1).
+	_ = clientConn.SetDeadline(time.Time{})
 	// Read tunnel bytes through the hijacked buffered reader, including any
 	// bytes pre-fetched with the CONNECT request. Never forward them before
 	// Naive padding has been decoded.
@@ -712,6 +718,91 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn, padding bool) error
 	// After Hijack, net/http detaches clientConn from r.Context(); rely on
 	// clientConn's own EOF/read errors instead of r.Context() cancellation.
 	return dualStream(context.Background(), targetConn, readCloser{Reader: brw.Reader, Closer: clientConn}, clientConn, padding)
+}
+
+// Caddy v2.11+ wraps request bodies and response writers with 1-minute default
+// read_body_idle / write_idle timeouts. Bidirectional CONNECT tunnels (such as
+// large downloads with a silent uplink or long-lived interactive sessions) can
+// legitimately stay idle in one direction far longer than 1 minute.
+const connectIdleTimeout = 24 * time.Hour
+
+type idleReadTimeoutOverrider interface {
+	Override(timeout time.Duration, minRate int64) func()
+}
+
+type idleWriteTimeoutOverrider interface {
+	Override(timeout time.Duration, minRate int64, maxChunk int) func()
+}
+
+func findIdleReadOverrider(r io.Reader) idleReadTimeoutOverrider {
+	for depth := 0; r != nil && depth < 16; depth++ {
+		if ov, ok := r.(idleReadTimeoutOverrider); ok {
+			return ov
+		}
+		switch u := r.(type) {
+		case interface{ Unwrap() io.ReadCloser }:
+			r = u.Unwrap()
+			continue
+		case interface{ Unwrap() io.Reader }:
+			r = u.Unwrap()
+			continue
+		}
+		// Caddy's access-log lengthReader wraps IdleTimeoutReader in an
+		// exported Source field without an Unwrap method.
+		rv := reflect.ValueOf(r)
+		if rv.Kind() == reflect.Ptr && !rv.IsNil() {
+			rv = rv.Elem()
+		}
+		if rv.Kind() == reflect.Struct {
+			if src := rv.FieldByName("Source"); src.IsValid() && src.CanInterface() {
+				if next, ok := src.Interface().(io.Reader); ok && next != nil {
+					r = next
+					continue
+				}
+			}
+		}
+		break
+	}
+	return nil
+}
+
+func findIdleWriteOverrider(w http.ResponseWriter) idleWriteTimeoutOverrider {
+	for depth := 0; w != nil && depth < 16; depth++ {
+		if ov, ok := w.(idleWriteTimeoutOverrider); ok {
+			return ov
+		}
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		w = u.Unwrap()
+	}
+	return nil
+}
+
+// overrideTunnelIdleTimeouts relaxes Caddy v2.11+'s per-request read_body_idle
+// and write_idle wrappers for established CONNECT tunnels while preserving any
+// explicit server-wide hard deadlines. Using structural interfaces keeps the
+// module compatible with both older Caddy v2 (without IdleTimeoutReader) and
+// Caddy v2.11+.
+func overrideTunnelIdleTimeouts(r *http.Request, w http.ResponseWriter, timeout time.Duration) func() {
+	var restoreRead, restoreWrite func()
+	if r != nil && r.Body != nil {
+		if ov := findIdleReadOverrider(r.Body); ov != nil {
+			restoreRead = ov.Override(timeout, 0)
+		}
+	}
+	if ov := findIdleWriteOverrider(w); ov != nil {
+		restoreWrite = ov.Override(timeout, 0, 0)
+	}
+	return func() {
+		if restoreWrite != nil {
+			restoreWrite()
+		}
+		if restoreRead != nil {
+			restoreRead()
+		}
+	}
 }
 
 const (
