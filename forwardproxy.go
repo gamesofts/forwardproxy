@@ -343,12 +343,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 		switch r.ProtoMajor {
 		case 1: // http1: hijack the whole flow
-			return serveHijack(w, targetConn, r.Header.Get("Padding") != "")
+			return serveHijack(ctx, w, targetConn, r.Header.Get("Padding") != "")
 		case 2: // http2: keep reading from "request" and writing into same response
 			fallthrough
 		case 3:
 			defer r.Body.Close()
-			return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "")
+			return dualStream(ctx, targetConn, r.Body, w, r.Header.Get("Padding") != "")
 		}
 
 		panic("There was a check for http version, yet it's incorrect")
@@ -686,9 +686,14 @@ func serveHiddenPage(w http.ResponseWriter, authErr error) error {
 	return nil
 }
 
+type readCloser struct {
+	io.Reader
+	io.Closer
+}
+
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
 // and hijacked connection.
-func serveHijack(w http.ResponseWriter, targetConn net.Conn, padding bool) error {
+func serveHijack(ctx context.Context, w http.ResponseWriter, targetConn net.Conn, padding bool) error {
 	w.WriteHeader(http.StatusOK)
 	clientConn, brw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
@@ -704,7 +709,7 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn, padding bool) error
 			fmt.Errorf("failed to flush to client: %v", err))
 	}
 
-	return dualStream(targetConn, io.NopCloser(brw.Reader), clientConn, padding)
+	return dualStream(ctx, targetConn, readCloser{Reader: brw.Reader, Closer: clientConn}, clientConn, padding)
 }
 
 const (
@@ -714,10 +719,37 @@ const (
 	NumFirstPaddings = 8
 )
 
-// Copies data target->clientReader and clientWriter->target, and flushes as needed
-// Returns when clientWriter-> target stream is done.
-// Caddy should finish writing target -> clientReader.
-func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) error {
+// Copies data target->clientWriter and clientReader->target, and flushes as needed.
+// Cancels and tears down both directions if ctx is canceled or clientReader fails
+// abnormally, while preserving clean TCP half-close on EOF. Waits for both copy
+// goroutines to finish before returning so pooled buffers and streams do not leak.
+func dualStream(ctx context.Context, target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) error {
+	var (
+		closeTargetOnce sync.Once
+		closeReaderOnce sync.Once
+	)
+	closeTarget := func() {
+		closeTargetOnce.Do(func() {
+			_ = target.Close()
+		})
+	}
+	closeClientReader := func() {
+		if clientReader == nil {
+			return
+		}
+		closeReaderOnce.Do(func() {
+			_ = clientReader.Close()
+		})
+	}
+
+	if ctx != nil {
+		stopWatch := context.AfterFunc(ctx, func() {
+			closeTarget()
+			closeClientReader()
+		})
+		defer stopWatch()
+	}
+
 	stream := func(w io.Writer, r io.Reader, paddingType int) error {
 		// copy bytes from r to w
 		bufPtr := bufferPool.Get().(*[]byte)
@@ -726,17 +758,35 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 		_, _err := flushingIoCopy(w, r, buf, paddingType)
 		bufferPool.Put(bufPtr)
 
-		if cw, ok := w.(closeWriter); ok {
-			_ = cw.CloseWrite()
+		if _err == nil {
+			if cw, ok := w.(closeWriter); ok {
+				_ = cw.CloseWrite()
+			}
 		}
 		return _err
 	}
+
+	upPadding, downPadding := NoPadding, NoPadding
 	if padding {
-		go stream(target, clientReader, RemovePadding)
-		return stream(clientWriter, target, AddPadding)
+		upPadding, downPadding = RemovePadding, AddPadding
 	}
-	go stream(target, clientReader, NoPadding) //nolint: errcheck
-	return stream(clientWriter, target, NoPadding)
+
+	uplinkDone := make(chan struct{})
+	go func() {
+		defer close(uplinkDone)
+		if upErr := stream(target, clientReader, upPadding); upErr != nil {
+			// Abnormal client termination (e.g. RST_STREAM, broken TCP, malformed
+			// Naive padding): wake the downlink reader instead of leaving a zombie
+			// tunnel holding the HTTP/2 stream slot, FD, and pooled buffer.
+			closeTarget()
+		}
+	}()
+
+	downErr := stream(clientWriter, target, downPadding)
+	closeClientReader()
+	closeTarget()
+	<-uplinkDone
+	return downErr
 }
 
 type closeWriter interface {
@@ -753,36 +803,36 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
 		rc = http.NewResponseController(rw)
 	}
 	var numPadding int
+	if paddingType == RemovePadding {
+		n, done, frameErr := removePaddingFrames(dst, src, buf, rc)
+		written += n
+		if frameErr != nil || done {
+			return written, frameErr
+		}
+		numPadding = NumFirstPaddings
+	}
 	for {
 		var nr int
 		var er error
 		if paddingType == AddPadding && numPadding < NumFirstPaddings {
 			numPadding++
 			paddingSize := rand.Intn(256)
-			maxRead := 65536 - 3 - paddingSize
+			maxBuf := len(buf)
+			if maxBuf > 65536 {
+				maxBuf = 65536
+			}
+			maxRead := maxBuf - 3 - paddingSize
+			if maxRead <= 3 {
+				return written, io.ErrShortBuffer
+			}
 			nr, er = src.Read(buf[3:maxRead])
 			if nr > 0 {
 				buf[0] = byte(nr / 256)
 				buf[1] = byte(nr % 256)
 				buf[2] = byte(paddingSize)
-				for i := 0; i < paddingSize; i++ {
-					buf[3+nr+i] = 0
-				}
+				clear(buf[3+nr : 3+nr+paddingSize])
 				nr += 3 + paddingSize
 			}
-		} else if paddingType == RemovePadding && numPadding < NumFirstPaddings {
-			numPadding++
-			// Forward payload chunks as soon as they arrive. Reading the
-			// complete frame (including padding) first delays the origin.
-			n, frameErr := copyUnpaddedFrame(dst, src, buf, rc)
-			written += n
-			if frameErr != nil {
-				if frameErr == io.EOF {
-					return written, nil // clean EOF at a frame boundary
-				}
-				return written, frameErr
-			}
-			continue
 		} else {
 			nr, er = src.Read(buf)
 		}
@@ -817,66 +867,124 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
 	return
 }
 
-// copyUnpaddedFrame streams one of Naive's first eight padded frames.
-// Unlike io.ReadFull(payload), it writes each available payload fragment
-// immediately while keeping padding bytes out of the destination stream.
-// It uses the caller's pooled buffer and does not invoke io.CopyBuffer's
-// ReaderFrom/WriterTo dispatch.
-func copyUnpaddedFrame(dst io.Writer, src io.Reader, buf []byte, rc *http.ResponseController) (written int64, err error) {
-	if len(buf) < 3 {
-		return 0, io.ErrShortBuffer
+// removePaddingFrames strips Naive's first NumFirstPaddings padded frames from src
+// using buffered reads into buf so each complete frame needs only one src.Read
+// (avoiding separate reads for header, payload, and padding) while still forwarding
+// partial payload chunks immediately as they arrive. Any raw bytes already read into
+// buf after the final padded frame are forwarded before returning.
+func removePaddingFrames(dst io.Writer, src io.Reader, buf []byte, rc *http.ResponseController) (written int64, done bool, err error) {
+	if len(buf) == 0 {
+		return 0, false, io.ErrShortBuffer
 	}
-	// No bytes at the next frame boundary means a clean stream EOF;
-	// a truncated header is always malformed.
-	if _, err := io.ReadFull(src, buf[:3]); err != nil {
-		return 0, err
-	}
-	remaining := int(buf[0])<<8 | int(buf[1])
-	paddingSize := int(buf[2])
+	const (
+		stateHeader = iota
+		statePayload
+		statePadding
+	)
+	var (
+		state      = stateHeader
+		hdr        [3]byte
+		hdrLen     int
+		payloadRem int
+		padRem     int
+		framesDone int
+	)
 
-	for remaining > 0 {
-		chunk := remaining
-		if chunk > len(buf) {
-			chunk = len(buf)
-		}
-		nr, readErr := src.Read(buf[:chunk])
-		if nr > 0 {
-			nw, writeErr := dst.Write(buf[:nr])
+	writeAndFlush := func(p []byte) error {
+		nw, ew := dst.Write(p)
+		if nw > 0 {
 			written += int64(nw)
-			if writeErr != nil {
-				return written, writeErr
+		}
+		if ew != nil {
+			return ew
+		}
+		if rc != nil {
+			if ef := rc.Flush(); ef != nil {
+				return ef
 			}
-			if rc != nil {
-				if flushErr := rc.Flush(); flushErr != nil {
-					return written, flushErr
+		}
+		if nw != len(p) {
+			return io.ErrShortWrite
+		}
+		return nil
+	}
+
+	for framesDone < NumFirstPaddings {
+		nr, readErr := src.Read(buf)
+		off := 0
+		for off < nr && framesDone < NumFirstPaddings {
+			switch state {
+			case stateHeader:
+				need := 3 - hdrLen
+				avail := nr - off
+				if avail < need {
+					copy(hdr[hdrLen:], buf[off:nr])
+					hdrLen += avail
+					off = nr
+					continue
+				}
+				copy(hdr[hdrLen:], buf[off:off+need])
+				off += need
+				hdrLen = 0
+				payloadRem = int(hdr[0])<<8 | int(hdr[1])
+				padRem = int(hdr[2])
+				if payloadRem > 0 {
+					state = statePayload
+				} else if padRem > 0 {
+					state = statePadding
+				} else {
+					framesDone++
+				}
+			case statePayload:
+				take := payloadRem
+				if avail := nr - off; avail < take {
+					take = avail
+				}
+				if ew := writeAndFlush(buf[off : off+take]); ew != nil {
+					return written, false, ew
+				}
+				off += take
+				payloadRem -= take
+				if payloadRem == 0 {
+					if padRem > 0 {
+						state = statePadding
+					} else {
+						framesDone++
+						state = stateHeader
+					}
+				}
+			case statePadding:
+				skip := padRem
+				if avail := nr - off; avail < skip {
+					skip = avail
+				}
+				off += skip
+				padRem -= skip
+				if padRem == 0 {
+					framesDone++
+					state = stateHeader
 				}
 			}
-			if nw != nr {
-				return written, io.ErrShortWrite
-			}
-			remaining -= nr
 		}
+
+		// Forward any raw bytes that arrived in the same read after the 8th padded frame.
+		if framesDone == NumFirstPaddings && off < nr {
+			if ew := writeAndFlush(buf[off:nr]); ew != nil {
+				return written, false, ew
+			}
+		}
+
 		if readErr != nil {
 			if readErr == io.EOF {
-				// An EOF paired with the final payload bytes is valid
-				// only if this frame has no remaining padding.
-				if remaining == 0 && paddingSize == 0 {
-					return written, nil
+				if framesDone == NumFirstPaddings || (state == stateHeader && hdrLen == 0) {
+					return written, true, nil
 				}
-				return written, io.ErrUnexpectedEOF
+				return written, false, io.ErrUnexpectedEOF
 			}
-			return written, readErr
+			return written, false, readErr
 		}
 	}
-	// Once all payload has been forwarded, consume the padding directly
-	// into the same buffer without copying it to the target.
-	if _, err := io.ReadFull(src, buf[:paddingSize]); err != nil {
-		if err == io.EOF {
-			return written, io.ErrUnexpectedEOF
-		}
-		return written, err
-	}
-	return written, nil
+	return written, false, nil
 }
 
 // Removes hop-by-hop headers, and writes response into ResponseWriter.

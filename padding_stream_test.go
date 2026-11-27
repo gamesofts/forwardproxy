@@ -177,3 +177,125 @@ func TestRemovePaddingCleanEOFAndShortWrite(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (w writerFunc) Write(p []byte) (int, error) { return w(p) }
+
+// chunkedCountingReader delivers pre-split chunks one per Read call and tracks
+// how many Read calls were needed (analogous to reading HTTP/2 DATA frames).
+type chunkedCountingReader struct {
+	chunks [][]byte
+	reads  int
+}
+
+func (r *chunkedCountingReader) Read(p []byte) (int, error) {
+	r.reads++
+	if len(r.chunks) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[0])
+	if n == len(r.chunks[0]) {
+		r.chunks = r.chunks[1:]
+	} else {
+		r.chunks[0] = r.chunks[0][n:]
+	}
+	return n, nil
+}
+
+// Verify each complete padded frame takes a single src.Read call instead of
+// three separate reads (header, payload, padding).
+func TestRemovePaddingMinimizesReadCalls(t *testing.T) {
+	chunks := make([][]byte, 0, NumFirstPaddings+1)
+	var want bytes.Buffer
+	for i := 0; i < NumFirstPaddings; i++ {
+		payload := bytes.Repeat([]byte{byte('a' + i)}, 128+i*17)
+		pad := bytes.Repeat([]byte{byte(0xf0 + i)}, 13+i*5)
+		chunks = append(chunks, appendPaddingFrame(nil, payload, pad))
+		want.Write(payload)
+	}
+	raw := []byte("post-padding-raw-data")
+	chunks = append(chunks, raw)
+	want.Write(raw)
+
+	src := &chunkedCountingReader{chunks: chunks}
+	var dst bytes.Buffer
+	n, err := flushingIoCopy(&dst, src, make([]byte, 64*1024), RemovePadding)
+	if err != nil {
+		t.Fatalf("flushingIoCopy failed: %v", err)
+	}
+	if !bytes.Equal(dst.Bytes(), want.Bytes()) || n != int64(want.Len()) {
+		t.Fatalf("decoded stream mismatch: got %d bytes, want %d, written %d", dst.Len(), want.Len(), n)
+	}
+	// 8 padded frame reads + 1 raw chunk read + 1 EOF read = 10 reads total
+	// (previous 3-read-per-frame implementation required 26 reads).
+	if wantReads := NumFirstPaddings + 2; src.reads != wantReads {
+		t.Fatalf("src.Read called %d times; want %d", src.reads, wantReads)
+	}
+}
+
+// Verify multiple padded frames and trailing raw bytes arriving in a single
+// Read call are decoded cleanly, both when followed by more raw data and on EOF.
+func TestRemovePaddingCoalescedFramesAndTrailingRawInSingleRead(t *testing.T) {
+	var firstChunk []byte
+	var want bytes.Buffer
+	for i := 0; i < NumFirstPaddings; i++ {
+		var payload []byte
+		if i%2 == 0 {
+			payload = bytes.Repeat([]byte{byte('0' + i)}, 32+i)
+		}
+		pad := bytes.Repeat([]byte{0xee}, i*3)
+		firstChunk = appendPaddingFrame(firstChunk, payload, pad)
+		want.Write(payload)
+	}
+	trailingRaw := []byte("trailing-raw-in-same-read")
+	firstChunk = append(firstChunk, trailingRaw...)
+	want.Write(trailingRaw)
+
+	t.Run("single read with immediate EOF", func(t *testing.T) {
+		var dst bytes.Buffer
+		n, err := flushingIoCopy(&dst, bytes.NewReader(firstChunk), make([]byte, 64*1024), RemovePadding)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(dst.Bytes(), want.Bytes()) || n != int64(want.Len()) {
+			t.Fatalf("mismatch: got %d, want %d, written %d", dst.Len(), want.Len(), n)
+		}
+	})
+
+	t.Run("single read followed by more raw chunks", func(t *testing.T) {
+		moreRaw := []byte("-and-next-raw-chunk")
+		src := &chunkedCountingReader{chunks: [][]byte{firstChunk, moreRaw}}
+		var dst bytes.Buffer
+		n, err := flushingIoCopy(&dst, src, make([]byte, 64*1024), RemovePadding)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		expected := append(append([]byte(nil), want.Bytes()...), moreRaw...)
+		if !bytes.Equal(dst.Bytes(), expected) || n != int64(len(expected)) {
+			t.Fatalf("mismatch: got %d, want %d, written %d", dst.Len(), len(expected), n)
+		}
+		if src.reads != 3 {
+			t.Fatalf("src.Read called %d times; want 3", src.reads)
+		}
+	})
+}
+
+func BenchmarkRemovePaddingFirst8Frames(b *testing.B) {
+	frames := make([][]byte, NumFirstPaddings)
+	var totalPayload int64
+	for i := 0; i < NumFirstPaddings; i++ {
+		payload := bytes.Repeat([]byte{byte(i + 1)}, 1024)
+		pad := make([]byte, 64)
+		frames[i] = appendPaddingFrame(nil, payload, pad)
+		totalPayload += int64(len(payload))
+	}
+	buf := make([]byte, 64*1024)
+	src := &chunkedCountingReader{}
+	b.ReportAllocs()
+	b.SetBytes(totalPayload)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		src.chunks = frames
+		src.reads = 0
+		if _, err := flushingIoCopy(io.Discard, src, buf, RemovePadding); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

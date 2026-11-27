@@ -1,6 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Tune Caddy's HTTP/2 receive windows and max concurrent streams for multiplexed NaiveProxy tunnels.
+patch_caddy_http2() {
+  local caddy_app="$1"
+  local replacement='&http2.Server{MaxUploadBufferPerConnection: 16 << 20, MaxUploadBufferPerStream: 4 << 20, MaxConcurrentStreams: 1000}'
+  if ! awk -v repl="$replacement" '
+    /^[[:space:]]*h2server := new\(http2\.Server\)$/ ||
+    /^[[:space:]]*http2\.ConfigureServer\(srv\.server, new\(http2\.Server\)\)$/ {
+      idx = index($0, "new(http2.Server)")
+      $0 = substr($0, 1, idx - 1) repl substr($0, idx + length("new(http2.Server)"))
+      matches++
+    }
+    /^[[:space:]]*h2server := &http2\.Server\{\}$/ {
+      idx = index($0, "&http2.Server{}")
+      $0 = substr($0, 1, idx - 1) repl substr($0, idx + length("&http2.Server{}"))
+      matches++
+    }
+    { print }
+    END { if (matches != 1) exit 1 }
+  ' "$caddy_app" > "$caddy_app.patched"; then
+    rm -f "$caddy_app.patched"
+    echo "Cannot apply the HTTP/2 server tuning to $caddy_app" >&2
+    return 1
+  fi
+  mv "$caddy_app.patched" "$caddy_app"
+}
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
 # Build the Caddy version tested by this module, using the local Naive plugin.
 # Pin xcaddy so its own dependency changes cannot silently break daily syncs.
 go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
@@ -11,26 +41,13 @@ if [[ ! "$caddy_version" =~ ^v2\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 
-# Give streams room to share the connection when one upload stalls.
 go mod download "$caddy_module@$caddy_version"
 caddy_source=$(mktemp -d)
 trap 'rm -rf "$caddy_source"' EXIT
 cp -R "$(go env GOMODCACHE)/$caddy_module@$caddy_version/." "$caddy_source/"
 chmod -R u+w "$caddy_source"
 caddy_app="$caddy_source/modules/caddyhttp/app.go"
-if ! awk '
-  /^[[:space:]]*h2server := new\(http2\.Server\)$/ ||
-  /^[[:space:]]*http2\.ConfigureServer\(srv\.server, new\(http2\.Server\)\)$/ {
-    sub(/new\(http2\.Server\)/, "\\&http2.Server{MaxUploadBufferPerConnection: 4 << 20, MaxUploadBufferPerStream: 1 << 20}")
-    matches++
-  }
-  { print }
-  END { if (matches != 1) exit 1 }
-' "$caddy_app" > "$caddy_app.patched"; then
-  echo "Cannot apply the HTTP/2 receive windows to Caddy $caddy_version" >&2
-  exit 1
-fi
-mv "$caddy_app.patched" "$caddy_app"
+patch_caddy_http2 "$caddy_app"
 
 plugins=(--with "github.com/caddyserver/forwardproxy=$PWD")
 if [[ -n "${CLOUDFLARE_VERSION:-}" ]]; then

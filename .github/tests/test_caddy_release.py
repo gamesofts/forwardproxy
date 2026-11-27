@@ -209,5 +209,47 @@ class ReleaseDetectionTests(unittest.TestCase):
             self.assertIsNone(detect.find_release("gamesofts/forwardproxy", "caddy-v2.11.7"))
 
 
+class CaddyHTTP2PatchTests(unittest.TestCase):
+    build_script = Path(__file__).parents[1] / "scripts/build-caddy.sh"
+
+    def run_patch(self, source: str):
+        with tempfile.TemporaryDirectory() as directory:
+            app_go = Path(directory) / "app.go"
+            app_go.write_text(source)
+            proc = subprocess.run(
+                ["bash", "-c", 'source "$1" && patch_caddy_http2 "$2"', "_", str(self.build_script), str(app_go)],
+                capture_output=True,
+                text=True,
+            )
+            return proc, app_go.read_text()
+
+    def test_patches_caddy_h2server_defaults(self):
+        cases = [
+            "\t\th2server := new(http2.Server)\n",
+            "\t\thttp2.ConfigureServer(srv.server, new(http2.Server))\n",
+            "\t\th2server := &http2.Server{}\n",
+        ]
+        expected = (
+            "&http2.Server{"
+            "MaxUploadBufferPerConnection: 16 << 20, "
+            "MaxUploadBufferPerStream: 4 << 20, "
+            "MaxConcurrentStreams: 1000}"
+        )
+        for line in cases:
+            with self.subTest(line=line.strip()):
+                proc, patched = self.run_patch("package caddyhttp\nfunc f() {\n" + line + "}\n")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(expected, patched)
+
+    def test_rejects_missing_or_multiple_matches(self):
+        proc, _ = self.run_patch("package caddyhttp\nfunc f() {}\n")
+        self.assertNotEqual(proc.returncode, 0)
+
+        proc, _ = self.run_patch(
+            "package caddyhttp\nfunc f() {\n\th2server := new(http2.Server)\n\th2server := &http2.Server{}\n}\n"
+        )
+        self.assertNotEqual(proc.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
